@@ -293,7 +293,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyPressMsg:
 		key := msg.Key()
 		if key.Code == 'c' && key.Mod.Contains(tea.ModCtrl) {
-			return m, tea.Quit
+			return m.quit()
 		}
 		switch m.screen {
 		case screenRepos:
@@ -307,10 +307,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m model) quit() (tea.Model, tea.Cmd) {
+	if m.running != nil && !m.running.Done {
+		killAction(m.running.cmd)
+	}
+	return m, tea.Quit
+}
+
 func (m model) updateRepos(key tea.Key) (tea.Model, tea.Cmd) {
 	switch key.Code {
 	case tea.KeyEscape, 'q':
-		return m, tea.Quit
+		return m.quit()
 	case tea.KeyUp, 'k':
 		if m.reposCursor > 0 {
 			m.reposCursor--
@@ -346,7 +353,7 @@ func (m model) updatePRs(key tea.Key) (tea.Model, tea.Cmd) {
 		m.status = ""
 		return m, nil
 	case 'q':
-		return m, tea.Quit
+		return m.quit()
 	case tea.KeyUp, 'k':
 		if m.prsCursor > 0 {
 			m.prsCursor--
@@ -396,8 +403,8 @@ func (m model) updateActions(key tea.Key) (tea.Model, tea.Cmd) {
 	}
 	switch key.Code {
 	case tea.KeyEscape:
-		if m.running != nil && !m.running.Done && m.running.cmd != nil && m.running.cmd.Process != nil {
-			_ = m.running.cmd.Process.Kill()
+		if m.running != nil && !m.running.Done {
+			killAction(m.running.cmd)
 		}
 		m.running = nil
 		m.runningExpand = false
@@ -410,7 +417,7 @@ func (m model) updateActions(key tea.Key) (tea.Model, tea.Cmd) {
 		m.inspecting = false
 		return m, nil
 	case 'q':
-		return m, tea.Quit
+		return m.quit()
 	case tea.KeyUp, 'k':
 		if m.actionsCursor > 0 {
 			m.actionsCursor--
@@ -663,6 +670,10 @@ func (m model) renderActions() string {
 		b.WriteString("\n" + warnStyle.Render(m.genErr) + "\n")
 	}
 
+	inspectHint := "i: inspect"
+	if m.inspecting {
+		inspectHint = "i: hide"
+	}
 	var help string
 	switch {
 	case m.prompt != promptNone:
@@ -670,9 +681,9 @@ func (m model) renderActions() string {
 	case m.generating:
 		help = "waiting for claude..."
 	case m.running != nil:
-		help = "↑/↓: navigate • enter: run • n: new • e: edit • i: inspect • ctrl+o: expand • esc: back • q: quit"
+		help = "↑/↓: navigate • enter: run • n: new • e: edit • " + inspectHint + " • ctrl+o: expand • esc: back • q: quit"
 	default:
-		help = "↑/↓: navigate • enter: run • n: new • e: edit • i: inspect • esc: back • q: quit"
+		help = "↑/↓: navigate • enter: run • n: new • e: edit • " + inspectHint + " • esc: back • q: quit"
 	}
 	b.WriteString("\n" + dimStyle.Render(help) + "\n")
 	return b.String()
@@ -680,7 +691,7 @@ func (m model) renderActions() string {
 
 func renderInspectPanel(a Action) string {
 	var b strings.Builder
-	b.WriteString(selectedStyle.Render(a.Name) + "\n")
+	fmt.Fprintf(&b, "%s  %s\n", flashStyle.Render("▶ inspecting"), a.Name)
 	if a.Command == "" {
 		b.WriteString(dimStyle.Render("│ (empty)") + "\n")
 		return b.String()

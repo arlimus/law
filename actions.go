@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 type Action struct {
@@ -111,6 +112,7 @@ type ActionEvent struct {
 func startAction(action Action, dir string) (chan ActionEvent, *exec.Cmd, error) {
 	cmd := exec.Command("sh", "-c", action.Command)
 	cmd.Dir = dir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, nil, err
@@ -153,4 +155,17 @@ func startAction(action Action, dir string) (chan ActionEvent, *exec.Cmd, error)
 		ch <- ActionEvent{Done: true, Code: code}
 	}()
 	return ch, cmd, nil
+}
+
+// killAction terminates the action's process and any descendants by signaling
+// the whole process group. Safe to call on a nil/already-finished cmd.
+func killAction(c *exec.Cmd) {
+	if c == nil || c.Process == nil {
+		return
+	}
+	if pgid, err := syscall.Getpgid(c.Process.Pid); err == nil {
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		return
+	}
+	_ = c.Process.Kill()
 }
