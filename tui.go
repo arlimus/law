@@ -36,6 +36,7 @@ type runningAction struct {
 	Command string
 	Lines   []string
 	Done    bool
+	Stopped bool
 	Code    int
 	Err     error
 	pipe    chan ActionEvent
@@ -44,6 +45,7 @@ type runningAction struct {
 
 type actionStartedMsg struct {
 	action Action
+	index  int
 	pipe   chan ActionEvent
 	cmd    *exec.Cmd
 	err    error
@@ -90,7 +92,7 @@ type model struct {
 	actionsErr    string
 	actionsPR     int
 
-	running       *runningAction
+	running       map[int]*runningAction
 	runningExpand bool
 
 	prompt      promptKind
@@ -152,13 +154,13 @@ func startReviewCmd(repo *Repo, prNumber int) tea.Cmd {
 	}
 }
 
-func runActionCmd(action Action, dir string) tea.Cmd {
+func runActionCmd(action Action, index int, dir string) tea.Cmd {
 	return func() tea.Msg {
 		ch, cmd, err := startAction(action, dir)
 		if err != nil {
-			return actionStartedMsg{action: action, err: err}
+			return actionStartedMsg{action: action, index: index, err: err}
 		}
-		return actionStartedMsg{action: action, pipe: ch, cmd: cmd}
+		return actionStartedMsg{action: action, index: index, pipe: ch, cmd: cmd}
 	}
 }
 
@@ -227,33 +229,37 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.openActions(msg.prNumber)
 
 	case actionStartedMsg:
+		if m.running == nil {
+			m.running = map[int]*runningAction{}
+		}
 		if msg.err != nil {
-			m.running = &runningAction{
+			m.running[msg.index] = &runningAction{
 				Name: msg.action.Name, Command: msg.action.Command,
 				Done: true, Err: msg.err, Code: -1,
 			}
 			return m, nil
 		}
-		m.running = &runningAction{
+		m.running[msg.index] = &runningAction{
 			Name: msg.action.Name, Command: msg.action.Command,
 			pipe: msg.pipe, cmd: msg.cmd,
 		}
 		return m, waitEventCmd(msg.pipe)
 
 	case actionEventMsg:
-		if m.running == nil || m.running.pipe != msg.pipe {
+		r := m.findRunningByPipe(msg.pipe)
+		if r == nil {
 			return m, nil
 		}
 		if msg.evt.Line != "" {
-			m.running.Lines = append(m.running.Lines, msg.evt.Line)
-			if len(m.running.Lines) > 5000 {
-				m.running.Lines = m.running.Lines[len(m.running.Lines)-5000:]
+			r.Lines = append(r.Lines, msg.evt.Line)
+			if len(r.Lines) > 5000 {
+				r.Lines = r.Lines[len(r.Lines)-5000:]
 			}
 		}
 		if msg.evt.Done {
-			m.running.Done = true
-			m.running.Code = msg.evt.Code
-			m.running.Err = msg.evt.Err
+			r.Done = true
+			r.Code = msg.evt.Code
+			r.Err = msg.evt.Err
 			return m, nil
 		}
 		return m, waitEventCmd(msg.pipe)
@@ -308,10 +314,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) quit() (tea.Model, tea.Cmd) {
-	if m.running != nil && !m.running.Done {
-		killAction(m.running.cmd)
-	}
+	m.killAllRunning()
 	return m, tea.Quit
+}
+
+func (m *model) killAllRunning() {
+	for _, r := range m.running {
+		if r != nil && !r.Done {
+			r.Stopped = true
+			killAction(r.cmd)
+		}
+	}
+}
+
+func (m *model) findRunningByPipe(p chan ActionEvent) *runningAction {
+	for _, r := range m.running {
+		if r != nil && r.pipe == p {
+			return r
+		}
+	}
+	return nil
 }
 
 func (m model) updateRepos(key tea.Key) (tea.Model, tea.Cmd) {
@@ -403,9 +425,7 @@ func (m model) updateActions(key tea.Key) (tea.Model, tea.Cmd) {
 	}
 	switch key.Code {
 	case tea.KeyEscape:
-		if m.running != nil && !m.running.Done {
-			killAction(m.running.cmd)
-		}
+		m.killAllRunning()
 		m.running = nil
 		m.runningExpand = false
 		m.screen = screenPRs
@@ -448,13 +468,19 @@ func (m model) updateActions(key tea.Key) (tea.Model, tea.Cmd) {
 		if m.actionsCursor >= len(m.actions) {
 			return m, nil
 		}
-		if m.running != nil && !m.running.Done {
+		if r, ok := m.running[m.actionsCursor]; ok && !r.Done {
 			return m, nil
 		}
 		action := m.actions[m.actionsCursor]
 		m.runningExpand = false
 		dir := reviewPath(m.currentRepo, m.actionsPR)
-		return m, runActionCmd(action, dir)
+		return m, runActionCmd(action, m.actionsCursor, dir)
+	case 's':
+		if r, ok := m.running[m.actionsCursor]; ok && !r.Done {
+			r.Stopped = true
+			killAction(r.cmd)
+		}
+		return m, nil
 	}
 	return m, nil
 }
@@ -657,7 +683,7 @@ func (m model) renderActions() string {
 				cursor = cursorStyle.Render("▸ ")
 				text = selectedStyle.Render(text)
 			}
-			b.WriteString(cursor + text + "\n")
+			b.WriteString(cursor + runMarker(m.running[i]) + " " + text + "\n")
 		}
 	}
 
@@ -665,8 +691,8 @@ func (m model) renderActions() string {
 		b.WriteString("\n" + renderInspectPanel(m.actions[m.actionsCursor]))
 	}
 
-	if m.running != nil {
-		b.WriteString("\n" + renderRunningPanel(m.running, m.runningExpand))
+	if r, ok := m.running[m.actionsCursor]; ok && r != nil {
+		b.WriteString("\n" + renderRunningPanel(r, m.runningExpand))
 	}
 
 	if m.prompt != promptNone {
@@ -688,10 +714,12 @@ func (m model) renderActions() string {
 		help = "enter: submit • esc: cancel"
 	case m.generating:
 		help = "waiting for claude..."
-	case m.running != nil:
-		help = "↑/↓: navigate • enter: run • n: new • e: edit • " + inspectHint + " • ctrl+o: expand • esc: back • q: quit"
 	default:
-		help = "↑/↓: navigate • enter: run • n: new • e: edit • " + inspectHint + " • esc: back • q: quit"
+		base := "↑/↓: navigate • enter: run • s: stop • n: new • e: edit • " + inspectHint
+		if r, ok := m.running[m.actionsCursor]; ok && r != nil {
+			base += " • ctrl+o: expand"
+		}
+		help = base + " • esc: back • q: quit"
 	}
 	b.WriteString("\n" + dimStyle.Render(help) + "\n")
 	return b.String()
@@ -728,11 +756,31 @@ func renderPrompt(m model) string {
 	return dimStyle.Render(label) + "\n" + "› " + m.input + cursorStyle.Render("█") + "\n"
 }
 
+func runMarker(r *runningAction) string {
+	if r == nil {
+		return " "
+	}
+	switch {
+	case !r.Done:
+		return flashStyle.Render("▶")
+	case r.Stopped:
+		return warnStyle.Render("■")
+	case r.Err != nil || r.Code != 0:
+		return warnStyle.Render("✗")
+	default:
+		return selectedStyle.Render("✓")
+	}
+}
+
 func renderRunningPanel(r *runningAction, expand bool) string {
 	var b strings.Builder
 
 	var status string
 	switch {
+	case r.Stopped && !r.Done:
+		status = warnStyle.Render("■ stopping")
+	case r.Stopped:
+		status = warnStyle.Render("■ stopped")
 	case !r.Done:
 		status = flashStyle.Render("▶ running")
 	case r.Err != nil:
