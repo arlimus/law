@@ -99,6 +99,7 @@ type model struct {
 	editIndex   int
 	generating  bool
 	genErr      string
+	inspecting  bool
 
 	status string
 	flash  string
@@ -406,6 +407,7 @@ func (m model) updateActions(key tea.Key) (tea.Model, tea.Cmd) {
 		m.actionsErr = ""
 		m.actionsPR = 0
 		m.genErr = ""
+		m.inspecting = false
 		return m, nil
 	case 'q':
 		return m, tea.Quit
@@ -428,6 +430,11 @@ func (m model) updateActions(key tea.Key) (tea.Model, tea.Cmd) {
 			m.editIndex = m.actionsCursor
 			m.input = ""
 			m.genErr = ""
+		}
+		return m, nil
+	case 'i':
+		if m.actionsCursor < len(m.actions) {
+			m.inspecting = !m.inspecting
 		}
 		return m, nil
 	case tea.KeyEnter:
@@ -639,6 +646,10 @@ func (m model) renderActions() string {
 		}
 	}
 
+	if m.inspecting && m.actionsCursor < len(m.actions) {
+		b.WriteString("\n" + renderInspectPanel(m.actions[m.actionsCursor]))
+	}
+
 	if m.running != nil {
 		b.WriteString("\n" + renderRunningPanel(m.running, m.runningExpand))
 	}
@@ -659,11 +670,24 @@ func (m model) renderActions() string {
 	case m.generating:
 		help = "waiting for claude..."
 	case m.running != nil:
-		help = "↑/↓: navigate • enter: run • n: new • e: edit • ctrl+o: expand • esc: back • q: quit"
+		help = "↑/↓: navigate • enter: run • n: new • e: edit • i: inspect • ctrl+o: expand • esc: back • q: quit"
 	default:
-		help = "↑/↓: navigate • enter: run • n: new • e: edit • esc: back • q: quit"
+		help = "↑/↓: navigate • enter: run • n: new • e: edit • i: inspect • esc: back • q: quit"
 	}
 	b.WriteString("\n" + dimStyle.Render(help) + "\n")
+	return b.String()
+}
+
+func renderInspectPanel(a Action) string {
+	var b strings.Builder
+	b.WriteString(selectedStyle.Render(a.Name) + "\n")
+	if a.Command == "" {
+		b.WriteString(dimStyle.Render("│ (empty)") + "\n")
+		return b.String()
+	}
+	for line := range strings.SplitSeq(a.Command, "\n") {
+		b.WriteString(dimStyle.Render("│ ") + line + "\n")
+	}
 	return b.String()
 }
 
@@ -703,7 +727,7 @@ func renderRunningPanel(r *runningAction, expand bool) string {
 	b.WriteString(dimStyle.Render("$ "+r.Command) + "\n")
 
 	lines := r.Lines
-	const tailN = 5
+	const tailN = 3
 	hidden := 0
 	if !expand && len(lines) > tailN {
 		hidden = len(lines) - tailN
