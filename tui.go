@@ -423,6 +423,14 @@ func (m model) updateActions(key tea.Key) (tea.Model, tea.Cmd) {
 		m.runningExpand = !m.runningExpand
 		return m, nil
 	}
+	if key.Mod.Contains(tea.ModCtrl) && key.Mod.Contains(tea.ModShift) {
+		switch key.Code {
+		case tea.KeyUp:
+			return m.moveAction(-1)
+		case tea.KeyDown:
+			return m.moveAction(1)
+		}
+	}
 	switch key.Code {
 	case tea.KeyEscape:
 		m.killAllRunning()
@@ -481,6 +489,32 @@ func (m model) updateActions(key tea.Key) (tea.Model, tea.Cmd) {
 			killAction(r.cmd)
 		}
 		return m, nil
+	}
+	return m, nil
+}
+
+func (m model) moveAction(delta int) (tea.Model, tea.Cmd) {
+	i := m.actionsCursor
+	j := i + delta
+	if i < 0 || i >= len(m.actions) || j < 0 || j >= len(m.actions) {
+		return m, nil
+	}
+	m.actions[i], m.actions[j] = m.actions[j], m.actions[i]
+	if m.running != nil {
+		ri, hasI := m.running[i]
+		rj, hasJ := m.running[j]
+		delete(m.running, i)
+		delete(m.running, j)
+		if hasI {
+			m.running[j] = ri
+		}
+		if hasJ {
+			m.running[i] = rj
+		}
+	}
+	m.actionsCursor = j
+	if err := saveRepoConfig(m.currentRepo.Path, &RepoConfig{Actions: m.actions}); err != nil {
+		m.genErr = "save: " + err.Error()
 	}
 	return m, nil
 }
