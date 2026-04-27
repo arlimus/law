@@ -215,6 +215,7 @@ var (
 	flashStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
 	warnStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 	markStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11"))
+	authorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("13"))
 )
 
 func (m model) View() tea.View {
@@ -296,7 +297,11 @@ func (m model) renderPRs() string {
 				cursor = cursorStyle.Render("▸ ")
 				text = selectedStyle.Render(text)
 			}
-			b.WriteString(cursor + mark + " " + ago + "  " + text + "\n")
+			line := cursor + mark + " " + ago + "  " + text
+			if pr.Author != "" {
+				line += "  " + authorStyle.Render("@"+pr.Author)
+			}
+			b.WriteString(line + "\n")
 		}
 	}
 

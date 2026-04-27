@@ -15,6 +15,7 @@ import (
 type pullRequest struct {
 	Number    int
 	Title     string
+	Author    string
 	CreatedAt time.Time
 	InReview  bool
 }
@@ -94,6 +95,9 @@ func fetchPRs(repo *Repo) ([]pullRequest, error) {
 		Number    int       `json:"number"`
 		Title     string    `json:"title"`
 		CreatedAt time.Time `json:"created_at"`
+		User      struct {
+			Login string `json:"login"`
+		} `json:"user"`
 	}
 	if err := json.Unmarshal(out, &raw); err != nil {
 		return nil, fmt.Errorf("parsing gh output: %w", err)
@@ -109,6 +113,7 @@ func fetchPRs(repo *Repo) ([]pullRequest, error) {
 		prs = append(prs, pullRequest{
 			Number:    r.Number,
 			Title:     r.Title,
+			Author:    r.User.Login,
 			CreatedAt: r.CreatedAt,
 			InReview:  active[r.Number],
 		})
