@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os/exec"
 	"strconv"
 	"strings"
 
@@ -14,6 +15,7 @@ type screen int
 const (
 	screenRepos screen = iota
 	screenPRs
+	screenActions
 )
 
 type prsLoadedMsg struct {
@@ -29,6 +31,46 @@ type reviewStartedMsg struct {
 	err      error
 }
 
+type runningAction struct {
+	Name    string
+	Command string
+	Lines   []string
+	Done    bool
+	Code    int
+	Err     error
+	pipe    chan ActionEvent
+	cmd     *exec.Cmd
+}
+
+type actionStartedMsg struct {
+	action Action
+	pipe   chan ActionEvent
+	cmd    *exec.Cmd
+	err    error
+}
+
+type actionEventMsg struct {
+	pipe chan ActionEvent
+	evt  ActionEvent
+}
+
+type promptKind int
+
+const (
+	promptNone promptKind = iota
+	promptNewName
+	promptNewDesc
+	promptEditDesc
+)
+
+type actionGeneratedMsg struct {
+	forEdit bool
+	index   int
+	name    string
+	command string
+	err     error
+}
+
 type model struct {
 	cfg     *Config
 	cfgPath string
@@ -42,6 +84,21 @@ type model struct {
 	prsCursor   int
 	prsLoading  bool
 	prsErr      string
+
+	actions       []Action
+	actionsCursor int
+	actionsErr    string
+	actionsPR     int
+
+	running       *runningAction
+	runningExpand bool
+
+	prompt      promptKind
+	input       string
+	pendingName string
+	editIndex   int
+	generating  bool
+	genErr      string
 
 	status string
 	flash  string
@@ -94,6 +151,40 @@ func startReviewCmd(repo *Repo, prNumber int) tea.Cmd {
 	}
 }
 
+func runActionCmd(action Action, dir string) tea.Cmd {
+	return func() tea.Msg {
+		ch, cmd, err := startAction(action, dir)
+		if err != nil {
+			return actionStartedMsg{action: action, err: err}
+		}
+		return actionStartedMsg{action: action, pipe: ch, cmd: cmd}
+	}
+}
+
+func generateActionCmd(repoPath, name, userPrompt string) tea.Cmd {
+	return func() tea.Msg {
+		c, err := generateActionCommand(repoPath, userPrompt)
+		return actionGeneratedMsg{name: name, command: c, err: err}
+	}
+}
+
+func editActionCmdGen(repoPath, name, current, userPrompt string, index int) tea.Cmd {
+	return func() tea.Msg {
+		c, err := editActionCommand(repoPath, name, current, userPrompt)
+		return actionGeneratedMsg{forEdit: true, index: index, name: name, command: c, err: err}
+	}
+}
+
+func waitEventCmd(pipe chan ActionEvent) tea.Cmd {
+	return func() tea.Msg {
+		evt, ok := <-pipe
+		if !ok {
+			return actionEventMsg{pipe: pipe, evt: ActionEvent{Done: true}}
+		}
+		return actionEventMsg{pipe: pipe, evt: evt}
+	}
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -124,14 +215,78 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.err != nil {
 			m.status = "review error: " + msg.err.Error()
-		} else {
-			m.status = "review ready at " + msg.path
-			for i := range m.prs {
-				if m.prs[i].Number == msg.prNumber {
-					m.prs[i].InReview = true
-				}
+			return m, nil
+		}
+		m.status = "review ready at " + msg.path
+		for i := range m.prs {
+			if m.prs[i].Number == msg.prNumber {
+				m.prs[i].InReview = true
 			}
 		}
+		return m.openActions(msg.prNumber)
+
+	case actionStartedMsg:
+		if msg.err != nil {
+			m.running = &runningAction{
+				Name: msg.action.Name, Command: msg.action.Command,
+				Done: true, Err: msg.err, Code: -1,
+			}
+			return m, nil
+		}
+		m.running = &runningAction{
+			Name: msg.action.Name, Command: msg.action.Command,
+			pipe: msg.pipe, cmd: msg.cmd,
+		}
+		return m, waitEventCmd(msg.pipe)
+
+	case actionEventMsg:
+		if m.running == nil || m.running.pipe != msg.pipe {
+			return m, nil
+		}
+		if msg.evt.Line != "" {
+			m.running.Lines = append(m.running.Lines, msg.evt.Line)
+			if len(m.running.Lines) > 5000 {
+				m.running.Lines = m.running.Lines[len(m.running.Lines)-5000:]
+			}
+		}
+		if msg.evt.Done {
+			m.running.Done = true
+			m.running.Code = msg.evt.Code
+			m.running.Err = msg.evt.Err
+			return m, nil
+		}
+		return m, waitEventCmd(msg.pipe)
+
+	case actionGeneratedMsg:
+		m.generating = false
+		if msg.err != nil {
+			m.genErr = msg.err.Error()
+			return m, nil
+		}
+		if msg.command == "" {
+			m.genErr = "claude returned an empty command"
+			return m, nil
+		}
+		cfg, err := loadRepoConfig(m.currentRepo.Path)
+		if err != nil {
+			m.genErr = "load: " + err.Error()
+			return m, nil
+		}
+		if msg.forEdit {
+			if msg.index < 0 || msg.index >= len(cfg.Actions) {
+				m.genErr = "action index out of range"
+				return m, nil
+			}
+			cfg.Actions[msg.index].Command = msg.command
+		} else {
+			cfg.Actions = append(cfg.Actions, Action{Name: msg.name, Command: msg.command})
+		}
+		if err := saveRepoConfig(m.currentRepo.Path, cfg); err != nil {
+			m.genErr = "save: " + err.Error()
+			return m, nil
+		}
+		m.actions = cfg.Actions
+		m.genErr = ""
 		return m, nil
 
 	case tea.KeyPressMsg:
@@ -144,6 +299,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateRepos(key)
 		case screenPRs:
 			return m.updatePRs(key)
+		case screenActions:
+			return m.updateActions(key)
 		}
 	}
 	return m, nil
@@ -200,9 +357,149 @@ func (m model) updatePRs(key tea.Key) (tea.Model, tea.Cmd) {
 	case tea.KeyEnter:
 		if m.currentRepo != nil && m.prsCursor < len(m.prs) {
 			pr := m.prs[m.prsCursor]
+			if pr.InReview {
+				return m.openActions(pr.Number)
+			}
 			m.status = fmt.Sprintf("starting review for #%d...", pr.Number)
 			return m, startReviewCmd(m.currentRepo, pr.Number)
 		}
+	}
+	return m, nil
+}
+
+func (m model) openActions(prNumber int) (tea.Model, tea.Cmd) {
+	m.screen = screenActions
+	m.actionsPR = prNumber
+	m.actionsCursor = 0
+	cfg, err := loadRepoConfig(m.currentRepo.Path)
+	if err != nil {
+		m.actionsErr = err.Error()
+		m.actions = nil
+	} else {
+		m.actions = cfg.Actions
+		m.actionsErr = ""
+	}
+	return m, nil
+}
+
+func (m model) updateActions(key tea.Key) (tea.Model, tea.Cmd) {
+	if m.prompt != promptNone {
+		return m.updatePrompt(key)
+	}
+	if m.generating {
+		return m, nil
+	}
+	if key.Code == 'o' && key.Mod.Contains(tea.ModCtrl) {
+		m.runningExpand = !m.runningExpand
+		return m, nil
+	}
+	switch key.Code {
+	case tea.KeyEscape:
+		if m.running != nil && !m.running.Done && m.running.cmd != nil && m.running.cmd.Process != nil {
+			_ = m.running.cmd.Process.Kill()
+		}
+		m.running = nil
+		m.runningExpand = false
+		m.screen = screenPRs
+		m.actions = nil
+		m.actionsCursor = 0
+		m.actionsErr = ""
+		m.actionsPR = 0
+		m.genErr = ""
+		return m, nil
+	case 'q':
+		return m, tea.Quit
+	case tea.KeyUp, 'k':
+		if m.actionsCursor > 0 {
+			m.actionsCursor--
+		}
+	case tea.KeyDown, 'j':
+		if m.actionsCursor < len(m.actions)-1 {
+			m.actionsCursor++
+		}
+	case 'n':
+		m.prompt = promptNewName
+		m.input = ""
+		m.genErr = ""
+		return m, nil
+	case 'e':
+		if m.actionsCursor < len(m.actions) {
+			m.prompt = promptEditDesc
+			m.editIndex = m.actionsCursor
+			m.input = ""
+			m.genErr = ""
+		}
+		return m, nil
+	case tea.KeyEnter:
+		if m.actionsCursor >= len(m.actions) {
+			return m, nil
+		}
+		if m.running != nil && !m.running.Done {
+			return m, nil
+		}
+		action := m.actions[m.actionsCursor]
+		m.runningExpand = false
+		dir := reviewPath(m.currentRepo, m.actionsPR)
+		return m, runActionCmd(action, dir)
+	}
+	return m, nil
+}
+
+func (m model) updatePrompt(key tea.Key) (tea.Model, tea.Cmd) {
+	switch key.Code {
+	case tea.KeyEscape:
+		m.prompt = promptNone
+		m.input = ""
+		m.pendingName = ""
+		m.editIndex = 0
+		return m, nil
+	case tea.KeyEnter:
+		v := strings.TrimSpace(m.input)
+		if v == "" {
+			return m, nil
+		}
+		return m.submitPrompt(v)
+	case tea.KeyBackspace:
+		if r := []rune(m.input); len(r) > 0 {
+			m.input = string(r[:len(r)-1])
+		}
+		return m, nil
+	}
+	if key.Text != "" && key.Mod&^tea.ModShift == 0 {
+		m.input += key.Text
+	}
+	return m, nil
+}
+
+func (m model) submitPrompt(v string) (tea.Model, tea.Cmd) {
+	switch m.prompt {
+	case promptNewName:
+		m.pendingName = v
+		m.input = ""
+		m.prompt = promptNewDesc
+		return m, nil
+	case promptNewDesc:
+		name := m.pendingName
+		m.pendingName = ""
+		m.input = ""
+		m.prompt = promptNone
+		m.generating = true
+		m.genErr = ""
+		return m, generateActionCmd(m.currentRepo.Path, name, v)
+	case promptEditDesc:
+		if m.editIndex < 0 || m.editIndex >= len(m.actions) {
+			m.prompt = promptNone
+			m.input = ""
+			return m, nil
+		}
+		action := m.actions[m.editIndex]
+		idx := m.editIndex
+		m.editIndex = 0
+		m.input = ""
+		m.prompt = promptNone
+		m.generating = true
+		m.genErr = ""
+		return m, editActionCmdGen(m.currentRepo.Path, action.Name, action.Command, v, idx)
 	}
 	return m, nil
 }
@@ -223,6 +520,8 @@ func (m model) View() tea.View {
 	switch m.screen {
 	case screenPRs:
 		v = tea.NewView(m.renderPRs())
+	case screenActions:
+		v = tea.NewView(m.renderActions())
 	default:
 		v = tea.NewView(m.renderRepos())
 	}
@@ -309,5 +608,112 @@ func (m model) renderPRs() string {
 		b.WriteString("\n" + flashStyle.Render(m.status) + "\n")
 	}
 	b.WriteString("\n" + dimStyle.Render("↑/↓: navigate • enter: start review • esc: back • q: quit") + "\n")
+	return b.String()
+}
+
+func (m model) renderActions() string {
+	var b strings.Builder
+	header := "law — actions"
+	if m.currentRepo != nil {
+		header = fmt.Sprintf("law — %s#%d actions", m.currentRepo.URL, m.actionsPR)
+	}
+	b.WriteString(titleStyle.Render(header) + "\n\n")
+
+	switch {
+	case m.actionsErr != "":
+		b.WriteString(warnStyle.Render("  "+m.actionsErr) + "\n")
+	case len(m.actions) == 0:
+		b.WriteString(dimStyle.Render("  no actions configured") + "\n")
+		if m.currentRepo != nil {
+			b.WriteString(dimStyle.Render("  define them in "+repoConfigPath(m.currentRepo.Path)) + "\n")
+		}
+	default:
+		for i, a := range m.actions {
+			cursor := "  "
+			text := a.Name
+			if i == m.actionsCursor {
+				cursor = cursorStyle.Render("▸ ")
+				text = selectedStyle.Render(text)
+			}
+			b.WriteString(cursor + text + "\n")
+		}
+	}
+
+	if m.running != nil {
+		b.WriteString("\n" + renderRunningPanel(m.running, m.runningExpand))
+	}
+
+	if m.prompt != promptNone {
+		b.WriteString("\n" + renderPrompt(m))
+	} else if m.generating {
+		b.WriteString("\n" + flashStyle.Render("generating with claude...") + "\n")
+	}
+	if m.genErr != "" {
+		b.WriteString("\n" + warnStyle.Render(m.genErr) + "\n")
+	}
+
+	var help string
+	switch {
+	case m.prompt != promptNone:
+		help = "enter: submit • esc: cancel"
+	case m.generating:
+		help = "waiting for claude..."
+	case m.running != nil:
+		help = "↑/↓: navigate • enter: run • n: new • e: edit • ctrl+o: expand • esc: back • q: quit"
+	default:
+		help = "↑/↓: navigate • enter: run • n: new • e: edit • esc: back • q: quit"
+	}
+	b.WriteString("\n" + dimStyle.Render(help) + "\n")
+	return b.String()
+}
+
+func renderPrompt(m model) string {
+	var label string
+	switch m.prompt {
+	case promptNewName:
+		label = "name for the new action:"
+	case promptNewDesc:
+		label = fmt.Sprintf("describe %q (claude will generate the shell command):", m.pendingName)
+	case promptEditDesc:
+		if m.editIndex < len(m.actions) {
+			a := m.actions[m.editIndex]
+			label = fmt.Sprintf("modify %q (current: %s):", a.Name, a.Command)
+		} else {
+			label = "modify:"
+		}
+	}
+	return dimStyle.Render(label) + "\n" + "› " + m.input + cursorStyle.Render("█") + "\n"
+}
+
+func renderRunningPanel(r *runningAction, expand bool) string {
+	var b strings.Builder
+
+	var status string
+	switch {
+	case !r.Done:
+		status = flashStyle.Render("▶ running")
+	case r.Err != nil:
+		status = warnStyle.Render("✗ " + r.Err.Error())
+	case r.Code != 0:
+		status = warnStyle.Render(fmt.Sprintf("✗ exit %d", r.Code))
+	default:
+		status = selectedStyle.Render("✓ done")
+	}
+	fmt.Fprintf(&b, "%s  %s\n", status, r.Name)
+	b.WriteString(dimStyle.Render("$ "+r.Command) + "\n")
+
+	lines := r.Lines
+	const tailN = 5
+	hidden := 0
+	if !expand && len(lines) > tailN {
+		hidden = len(lines) - tailN
+		lines = lines[hidden:]
+	}
+	if !expand && hidden > 0 {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("│ … %d earlier lines (ctrl+o to expand)", hidden)) + "\n")
+	}
+	for _, ln := range lines {
+		b.WriteString(dimStyle.Render("│ ") + ln + "\n")
+	}
 	return b.String()
 }
