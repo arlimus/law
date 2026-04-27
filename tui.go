@@ -529,6 +529,9 @@ var (
 	authorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("13"))
 )
 
+// githubIcon is the Nerd Fonts FontAwesome github glyph (nf-fa-github, U+F09B).
+const githubIcon = ""
+
 func (m model) View() tea.View {
 	var v tea.View
 	switch m.screen {
@@ -627,11 +630,16 @@ func (m model) renderPRs() string {
 
 func (m model) renderActions() string {
 	var b strings.Builder
-	header := "law — actions"
 	if m.currentRepo != nil {
-		header = fmt.Sprintf("law — %s#%d actions", m.currentRepo.URL, m.actionsPR)
+		if owner, repo, ok := m.currentRepo.ownerRepo(); ok {
+			b.WriteString(titleStyle.Render(fmt.Sprintf("law - %s %s/%s #%d", githubIcon, owner, repo, m.actionsPR)) + "\n")
+			b.WriteString(dimStyle.Render(fmt.Sprintf("https://github.com/%s/%s/pull/%d", owner, repo, m.actionsPR)) + "\n\n")
+		} else {
+			b.WriteString(titleStyle.Render(fmt.Sprintf("law - %s %s #%d", githubIcon, m.currentRepo.URL, m.actionsPR)) + "\n\n")
+		}
+	} else {
+		b.WriteString(titleStyle.Render("law - actions") + "\n\n")
 	}
-	b.WriteString(titleStyle.Render(header) + "\n\n")
 
 	switch {
 	case m.actionsErr != "":
