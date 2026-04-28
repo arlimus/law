@@ -45,6 +45,7 @@ type runningAction struct {
 
 type actionStartedMsg struct {
 	action Action
+	pr     int
 	index  int
 	pipe   chan ActionEvent
 	cmd    *exec.Cmd
@@ -92,7 +93,7 @@ type model struct {
 	actionsErr    string
 	actionsPR     int
 
-	running       map[int]*runningAction
+	running       map[int]map[int]*runningAction
 	runningExpand bool
 
 	prompt      promptKind
@@ -154,13 +155,13 @@ func startReviewCmd(repo *Repo, prNumber int) tea.Cmd {
 	}
 }
 
-func runActionCmd(action Action, index int, dir string) tea.Cmd {
+func runActionCmd(action Action, pr, index int, dir string) tea.Cmd {
 	return func() tea.Msg {
 		ch, cmd, err := startAction(action, dir)
 		if err != nil {
-			return actionStartedMsg{action: action, index: index, err: err}
+			return actionStartedMsg{action: action, pr: pr, index: index, err: err}
 		}
-		return actionStartedMsg{action: action, index: index, pipe: ch, cmd: cmd}
+		return actionStartedMsg{action: action, pr: pr, index: index, pipe: ch, cmd: cmd}
 	}
 }
 
@@ -210,6 +211,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.prsCursor = 0
 			}
 		}
+		if m.status == "refreshing..." {
+			m.status = ""
+		}
 		return m, nil
 
 	case reviewStartedMsg:
@@ -230,16 +234,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case actionStartedMsg:
 		if m.running == nil {
-			m.running = map[int]*runningAction{}
+			m.running = map[int]map[int]*runningAction{}
+		}
+		if m.running[msg.pr] == nil {
+			m.running[msg.pr] = map[int]*runningAction{}
 		}
 		if msg.err != nil {
-			m.running[msg.index] = &runningAction{
+			m.running[msg.pr][msg.index] = &runningAction{
 				Name: msg.action.Name, Command: msg.action.Command,
 				Done: true, Err: msg.err, Code: -1,
 			}
 			return m, nil
 		}
-		m.running[msg.index] = &runningAction{
+		m.running[msg.pr][msg.index] = &runningAction{
 			Name: msg.action.Name, Command: msg.action.Command,
 			pipe: msg.pipe, cmd: msg.cmd,
 		}
@@ -319,21 +326,43 @@ func (m model) quit() (tea.Model, tea.Cmd) {
 }
 
 func (m *model) killAllRunning() {
-	for _, r := range m.running {
-		if r != nil && !r.Done {
-			r.Stopped = true
-			killAction(r.cmd)
+	for _, prMap := range m.running {
+		for _, r := range prMap {
+			if r != nil && !r.Done {
+				r.Stopped = true
+				killAction(r.cmd)
+			}
 		}
 	}
 }
 
 func (m *model) findRunningByPipe(p chan ActionEvent) *runningAction {
-	for _, r := range m.running {
-		if r != nil && r.pipe == p {
-			return r
+	for _, prMap := range m.running {
+		for _, r := range prMap {
+			if r != nil && r.pipe == p {
+				return r
+			}
 		}
 	}
 	return nil
+}
+
+func (m model) prHasRunning(prNumber int) bool {
+	for _, r := range m.running[prNumber] {
+		if r != nil && !r.Done {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *model) stopPR(prNumber int) {
+	for _, r := range m.running[prNumber] {
+		if r != nil && !r.Done {
+			r.Stopped = true
+			killAction(r.cmd)
+		}
+	}
 }
 
 func (m model) updateRepos(key tea.Key) (tea.Model, tea.Cmd) {
@@ -393,6 +422,18 @@ func (m model) updatePRs(key tea.Key) (tea.Model, tea.Cmd) {
 			m.status = fmt.Sprintf("starting review for #%d...", pr.Number)
 			return m, startReviewCmd(m.currentRepo, pr.Number)
 		}
+	case 'r':
+		if m.currentRepo != nil && !m.prsLoading {
+			m.prsLoading = true
+			m.prsErr = ""
+			m.status = "refreshing..."
+			return m, fetchPRsCmd(m.currentRepo)
+		}
+	case 's':
+		if m.prsCursor < len(m.prs) {
+			m.stopPR(m.prs[m.prsCursor].Number)
+		}
+		return m, nil
 	}
 	return m, nil
 }
@@ -433,8 +474,6 @@ func (m model) updateActions(key tea.Key) (tea.Model, tea.Cmd) {
 	}
 	switch key.Code {
 	case tea.KeyEscape:
-		m.killAllRunning()
-		m.running = nil
 		m.runningExpand = false
 		m.screen = screenPRs
 		m.actions = nil
@@ -476,15 +515,15 @@ func (m model) updateActions(key tea.Key) (tea.Model, tea.Cmd) {
 		if m.actionsCursor >= len(m.actions) {
 			return m, nil
 		}
-		if r, ok := m.running[m.actionsCursor]; ok && !r.Done {
+		if r, ok := m.running[m.actionsPR][m.actionsCursor]; ok && !r.Done {
 			return m, nil
 		}
 		action := m.actions[m.actionsCursor]
 		m.runningExpand = false
 		dir := reviewPath(m.currentRepo, m.actionsPR)
-		return m, runActionCmd(action, m.actionsCursor, dir)
+		return m, runActionCmd(action, m.actionsPR, m.actionsCursor, dir)
 	case 's':
-		if r, ok := m.running[m.actionsCursor]; ok && !r.Done {
+		if r, ok := m.running[m.actionsPR][m.actionsCursor]; ok && !r.Done {
 			r.Stopped = true
 			killAction(r.cmd)
 		}
@@ -500,16 +539,16 @@ func (m model) moveAction(delta int) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.actions[i], m.actions[j] = m.actions[j], m.actions[i]
-	if m.running != nil {
-		ri, hasI := m.running[i]
-		rj, hasJ := m.running[j]
-		delete(m.running, i)
-		delete(m.running, j)
+	if prMap := m.running[m.actionsPR]; prMap != nil {
+		ri, hasI := prMap[i]
+		rj, hasJ := prMap[j]
+		delete(prMap, i)
+		delete(prMap, j)
 		if hasI {
-			m.running[j] = ri
+			prMap[j] = ri
 		}
 		if hasJ {
-			m.running[i] = rj
+			prMap[i] = rj
 		}
 	}
 	m.actionsCursor = j
@@ -662,9 +701,13 @@ func (m model) renderPRs() string {
 		}
 		for i, pr := range m.prs {
 			cursor := "  "
-			mark := " "
+			mark := "  "
 			if pr.InReview {
-				mark = markStyle.Render("*")
+				if m.prHasRunning(pr.Number) {
+					mark = markStyle.Render("*") + flashStyle.Render("●")
+				} else {
+					mark = markStyle.Render("*") + " "
+				}
 			}
 			numStr := fmt.Sprintf("%*d", numWidth, pr.Number)
 			ago := dimStyle.Render(fmt.Sprintf("%*s", agoWidth, agos[i]))
@@ -684,7 +727,7 @@ func (m model) renderPRs() string {
 	if m.status != "" {
 		b.WriteString("\n" + flashStyle.Render(m.status) + "\n")
 	}
-	b.WriteString("\n" + dimStyle.Render("↑/↓: navigate • enter: start review • esc: back • q: quit") + "\n")
+	b.WriteString("\n" + dimStyle.Render("↑/↓: navigate • enter: start review • r: refresh • s: stop running • esc: back • q: quit") + "\n")
 	return b.String()
 }
 
@@ -717,7 +760,7 @@ func (m model) renderActions() string {
 				cursor = cursorStyle.Render("▸ ")
 				text = selectedStyle.Render(text)
 			}
-			b.WriteString(cursor + runMarker(m.running[i]) + " " + text + "\n")
+			b.WriteString(cursor + runMarker(m.running[m.actionsPR][i]) + " " + text + "\n")
 		}
 	}
 
@@ -725,7 +768,7 @@ func (m model) renderActions() string {
 		b.WriteString("\n" + renderInspectPanel(m.actions[m.actionsCursor]))
 	}
 
-	if r, ok := m.running[m.actionsCursor]; ok && r != nil {
+	if r, ok := m.running[m.actionsPR][m.actionsCursor]; ok && r != nil {
 		b.WriteString("\n" + renderRunningPanel(r, m.runningExpand))
 	}
 
@@ -750,7 +793,7 @@ func (m model) renderActions() string {
 		help = "waiting for claude..."
 	default:
 		base := "↑/↓: navigate • enter: run • s: stop • n: new • e: edit • " + inspectHint
-		if r, ok := m.running[m.actionsCursor]; ok && r != nil {
+		if r, ok := m.running[m.actionsPR][m.actionsCursor]; ok && r != nil {
 			base += " • ctrl+o: expand"
 		}
 		help = base + " • esc: back • q: quit"
