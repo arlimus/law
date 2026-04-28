@@ -83,10 +83,11 @@ type model struct {
 
 	currentRepo *Repo
 	autoPR      int
-	prs         []pullRequest
-	prsCursor   int
-	prsLoading  bool
-	prsErr      string
+	prs           []pullRequest
+	prsCursor     int
+	prsLoading    bool
+	prsErr        string
+	confirmDelete int
 
 	actions       []Action
 	actionsCursor int
@@ -393,6 +394,12 @@ func (m model) updateRepos(key tea.Key) (tea.Model, tea.Cmd) {
 }
 
 func (m model) updatePRs(key tea.Key) (tea.Model, tea.Cmd) {
+	if key.Code != 'd' && m.confirmDelete != 0 {
+		m.confirmDelete = 0
+		if strings.HasPrefix(m.status, "press d again") {
+			m.status = ""
+		}
+	}
 	switch key.Code {
 	case tea.KeyEscape:
 		m.screen = screenRepos
@@ -433,6 +440,33 @@ func (m model) updatePRs(key tea.Key) (tea.Model, tea.Cmd) {
 		if m.prsCursor < len(m.prs) {
 			m.stopPR(m.prs[m.prsCursor].Number)
 		}
+		return m, nil
+	case 'd':
+		if m.prsCursor >= len(m.prs) || !m.prs[m.prsCursor].InReview {
+			return m, nil
+		}
+		pr := m.prs[m.prsCursor]
+		if m.confirmDelete != pr.Number {
+			m.confirmDelete = pr.Number
+			m.status = fmt.Sprintf("press d again to delete .review%d", pr.Number)
+			return m, nil
+		}
+		m.confirmDelete = 0
+		m.stopPR(pr.Number)
+		if err := removeReview(m.currentRepo, pr.Number); err != nil {
+			m.status = "delete failed: " + err.Error()
+			return m, nil
+		}
+		delete(m.running, pr.Number)
+		if pr.Status == "open" {
+			m.prs[m.prsCursor].InReview = false
+		} else {
+			m.prs = append(m.prs[:m.prsCursor], m.prs[m.prsCursor+1:]...)
+			if m.prsCursor >= len(m.prs) && m.prsCursor > 0 {
+				m.prsCursor--
+			}
+		}
+		m.status = fmt.Sprintf("deleted .review%d", pr.Number)
 		return m, nil
 	}
 	return m, nil
@@ -626,6 +660,13 @@ var (
 	warnStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 	markStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11"))
 	authorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("13"))
+	mergedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("5"))
+)
+
+// Nerd Fonts Octicons for PR state.
+const (
+	mergedIcon = "" // nf-oct-git_merge
+	closedIcon = "" // nf-oct-git_pull_request_closed
 )
 
 // githubIcon is the Nerd Fonts FontAwesome github glyph (nf-fa-github, U+F09B).
@@ -711,12 +752,19 @@ func (m model) renderPRs() string {
 			}
 			numStr := fmt.Sprintf("%*d", numWidth, pr.Number)
 			ago := dimStyle.Render(fmt.Sprintf("%*s", agoWidth, agos[i]))
+			statusIcon := "  "
+			switch pr.Status {
+			case "merged":
+				statusIcon = mergedStyle.Render(mergedIcon) + " "
+			case "closed", "unknown":
+				statusIcon = warnStyle.Render(closedIcon) + " "
+			}
 			text := fmt.Sprintf("%s: %s", numStr, pr.Title)
 			if i == m.prsCursor {
 				cursor = cursorStyle.Render("▸ ")
 				text = selectedStyle.Render(text)
 			}
-			line := cursor + mark + " " + ago + "  " + text
+			line := cursor + mark + " " + ago + "  " + statusIcon + text
 			if pr.Author != "" {
 				line += "  " + authorStyle.Render("@"+pr.Author)
 			}
@@ -727,7 +775,7 @@ func (m model) renderPRs() string {
 	if m.status != "" {
 		b.WriteString("\n" + flashStyle.Render(m.status) + "\n")
 	}
-	b.WriteString("\n" + dimStyle.Render("↑/↓: navigate • enter: start review • r: refresh • s: stop running • esc: back • q: quit") + "\n")
+	b.WriteString("\n" + dimStyle.Render("↑/↓: navigate • enter: start review • r: refresh • s: stop running • d: delete folder • esc: back • q: quit") + "\n")
 	return b.String()
 }
 

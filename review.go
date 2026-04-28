@@ -18,6 +18,7 @@ type pullRequest struct {
 	Author    string
 	CreatedAt time.Time
 	InReview  bool
+	Status    string // "open", "merged", "closed", "unknown"
 }
 
 // humanizeAgo renders a past duration as a short relative string like "3d" or "2mo".
@@ -108,21 +109,70 @@ func fetchPRs(repo *Repo) ([]pullRequest, error) {
 		active[n] = true
 	}
 
-	prs := make([]pullRequest, 0, len(raw))
+	seen := make(map[int]bool, len(raw))
+	prs := make([]pullRequest, 0, len(raw)+len(active))
 	for _, r := range raw {
+		seen[r.Number] = true
 		prs = append(prs, pullRequest{
 			Number:    r.Number,
 			Title:     r.Title,
 			Author:    r.User.Login,
 			CreatedAt: r.CreatedAt,
 			InReview:  active[r.Number],
+			Status:    "open",
 		})
 	}
+
+	// Local review folders without a matching open PR are old (merged/closed).
+	for n := range active {
+		if seen[n] {
+			continue
+		}
+		prs = append(prs, fetchClosedPR(owner, name, n))
+	}
+
+	sort.Slice(prs, func(i, j int) bool { return prs[i].Number > prs[j].Number })
 	return prs, nil
+}
+
+func fetchClosedPR(owner, name string, number int) pullRequest {
+	cmd := exec.Command("gh", "api", fmt.Sprintf("repos/%s/%s/pulls/%d", owner, name, number))
+	out, err := cmd.Output()
+	if err != nil {
+		return pullRequest{Number: number, Title: "(unavailable)", InReview: true, Status: "unknown"}
+	}
+	var r struct {
+		Number    int        `json:"number"`
+		Title     string     `json:"title"`
+		CreatedAt time.Time  `json:"created_at"`
+		MergedAt  *time.Time `json:"merged_at"`
+		User      struct {
+			Login string `json:"login"`
+		} `json:"user"`
+	}
+	if err := json.Unmarshal(out, &r); err != nil {
+		return pullRequest{Number: number, Title: "(parse error)", InReview: true, Status: "unknown"}
+	}
+	status := "closed"
+	if r.MergedAt != nil {
+		status = "merged"
+	}
+	return pullRequest{
+		Number:    r.Number,
+		Title:     r.Title,
+		Author:    r.User.Login,
+		CreatedAt: r.CreatedAt,
+		InReview:  true,
+		Status:    status,
+	}
 }
 
 func reviewPath(repo *Repo, prNumber int) string {
 	return filepath.Join(repo.Path, fmt.Sprintf("%s%d", reviewPrefix, prNumber))
+}
+
+func removeReview(repo *Repo, prNumber int) error {
+	return os.RemoveAll(reviewPath(repo, prNumber))
 }
 
 func startReview(repo *Repo, prNumber int) (string, error) {
