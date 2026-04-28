@@ -825,7 +825,7 @@ func (m model) renderActions() string {
 			b.WriteString(titleStyle.Render(fmt.Sprintf("law - %s %s #%d", githubIcon, m.currentRepo.URL, m.actionsPR)) + "\n")
 		}
 		for _, p := range m.previews[m.actionsPR] {
-			b.WriteString(authorStyle.Render(previewIcon) + " " + p.Name + ": " + dimStyle.Render(p.URL) + "\n")
+			b.WriteString(hyperlink(p.URL, authorStyle.Render(previewIcon)+" preview: "+p.Name) + "\n")
 		}
 		b.WriteString("\n")
 	} else {
