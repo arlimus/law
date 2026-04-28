@@ -66,6 +66,11 @@ const (
 	promptEditDesc
 )
 
+type previewsLoadedMsg struct {
+	prNumber int
+	previews []vercelPreview
+}
+
 type actionGeneratedMsg struct {
 	forEdit bool
 	index   int
@@ -93,6 +98,8 @@ type model struct {
 	actionsCursor int
 	actionsErr    string
 	actionsPR     int
+
+	previews map[int][]vercelPreview
 
 	running       map[int]map[int]*runningAction
 	runningExpand bool
@@ -177,6 +184,12 @@ func editActionCmdGen(repoPath, name, current, userPrompt string, index int) tea
 	return func() tea.Msg {
 		c, err := editActionCommand(repoPath, name, current, userPrompt)
 		return actionGeneratedMsg{forEdit: true, index: index, name: name, command: c, err: err}
+	}
+}
+
+func fetchPreviewsCmd(owner, name string, prNumber int) tea.Cmd {
+	return func() tea.Msg {
+		return previewsLoadedMsg{prNumber: prNumber, previews: fetchVercelPreviews(owner, name, prNumber)}
 	}
 }
 
@@ -271,6 +284,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m, waitEventCmd(msg.pipe)
+
+	case previewsLoadedMsg:
+		if m.previews == nil {
+			m.previews = map[int][]vercelPreview{}
+		}
+		m.previews[msg.prNumber] = msg.previews
+		return m, nil
 
 	case actionGeneratedMsg:
 		m.generating = false
@@ -484,7 +504,13 @@ func (m model) openActions(prNumber int) (tea.Model, tea.Cmd) {
 		m.actions = cfg.Actions
 		m.actionsErr = ""
 	}
-	return m, nil
+	var cmd tea.Cmd
+	if _, cached := m.previews[prNumber]; !cached {
+		if owner, repo, ok := m.currentRepo.ownerRepo(); ok {
+			cmd = fetchPreviewsCmd(owner, repo, prNumber)
+		}
+	}
+	return m, cmd
 }
 
 func (m model) updateActions(key tea.Key) (tea.Model, tea.Cmd) {
@@ -663,6 +689,12 @@ var (
 	mergedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("5"))
 )
 
+// hyperlink wraps text in an OSC 8 escape so kitty/iTerm2/wezterm/alacritty/ghostty
+// render it as a clickable link. Terminals without OSC 8 support just show the text.
+func hyperlink(url, text string) string {
+	return "\x1b]8;;" + url + "\x1b\\" + text + "\x1b]8;;\x1b\\"
+}
+
 // Nerd Fonts Octicons for PR state.
 const (
 	mergedIcon = "" // nf-oct-git_merge
@@ -759,12 +791,16 @@ func (m model) renderPRs() string {
 			case "closed", "unknown":
 				statusIcon = warnStyle.Render(closedIcon) + " "
 			}
-			text := fmt.Sprintf("%s: %s", numStr, pr.Title)
+			rest := ": " + pr.Title
 			if i == m.prsCursor {
 				cursor = cursorStyle.Render("▸ ")
-				text = selectedStyle.Render(text)
+				numStr = selectedStyle.Render(numStr)
+				rest = selectedStyle.Render(rest)
 			}
-			line := cursor + mark + " " + ago + "  " + statusIcon + text
+			if owner, repo, ok := m.currentRepo.ownerRepo(); ok {
+				numStr = hyperlink(fmt.Sprintf("https://github.com/%s/%s/pull/%d", owner, repo, pr.Number), numStr)
+			}
+			line := cursor + mark + " " + ago + "  " + statusIcon + numStr + rest
 			if pr.Author != "" {
 				line += "  " + authorStyle.Render("@"+pr.Author)
 			}
@@ -784,10 +820,14 @@ func (m model) renderActions() string {
 	if m.currentRepo != nil {
 		if owner, repo, ok := m.currentRepo.ownerRepo(); ok {
 			b.WriteString(titleStyle.Render(fmt.Sprintf("law - %s %s/%s #%d", githubIcon, owner, repo, m.actionsPR)) + "\n")
-			b.WriteString(dimStyle.Render(fmt.Sprintf("https://github.com/%s/%s/pull/%d", owner, repo, m.actionsPR)) + "\n\n")
+			b.WriteString(dimStyle.Render(fmt.Sprintf("https://github.com/%s/%s/pull/%d", owner, repo, m.actionsPR)) + "\n")
 		} else {
-			b.WriteString(titleStyle.Render(fmt.Sprintf("law - %s %s #%d", githubIcon, m.currentRepo.URL, m.actionsPR)) + "\n\n")
+			b.WriteString(titleStyle.Render(fmt.Sprintf("law - %s %s #%d", githubIcon, m.currentRepo.URL, m.actionsPR)) + "\n")
 		}
+		for _, p := range m.previews[m.actionsPR] {
+			b.WriteString(authorStyle.Render(previewIcon) + " " + p.Name + ": " + dimStyle.Render(p.URL) + "\n")
+		}
+		b.WriteString("\n")
 	} else {
 		b.WriteString(titleStyle.Render("law - actions") + "\n\n")
 	}
