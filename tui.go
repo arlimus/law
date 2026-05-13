@@ -478,7 +478,7 @@ func (m model) updatePRs(key tea.Key) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		delete(m.running, pr.Number)
-		if pr.Status == "open" {
+		if pr.Status == "open" || pr.Status == "draft" {
 			m.prs[m.prsCursor].InReview = false
 		} else {
 			m.prs = append(m.prs[:m.prsCursor], m.prs[m.prsCursor+1:]...)
@@ -699,6 +699,7 @@ func hyperlink(url, text string) string {
 const (
 	mergedIcon = "" // nf-oct-git_merge
 	closedIcon = "" // nf-oct-git_pull_request_closed
+	draftIcon  = "⏹"
 )
 
 // githubIcon is the Nerd Fonts FontAwesome github glyph (nf-fa-github, U+F09B).
@@ -790,6 +791,8 @@ func (m model) renderPRs() string {
 				statusIcon = mergedStyle.Render(mergedIcon) + " "
 			case "closed", "unknown":
 				statusIcon = warnStyle.Render(closedIcon) + " "
+			case "draft":
+				statusIcon = dimStyle.Render(draftIcon) + " "
 			}
 			rest := ": " + pr.Title
 			if i == m.prsCursor {

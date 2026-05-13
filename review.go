@@ -18,7 +18,7 @@ type pullRequest struct {
 	Author    string
 	CreatedAt time.Time
 	InReview  bool
-	Status    string // "open", "merged", "closed", "unknown"
+	Status    string // "open", "draft", "merged", "closed", "unknown"
 }
 
 // humanizeAgo renders a past duration as a short relative string like "3d" or "2mo".
@@ -96,6 +96,7 @@ func fetchPRs(repo *Repo) ([]pullRequest, error) {
 		Number    int       `json:"number"`
 		Title     string    `json:"title"`
 		CreatedAt time.Time `json:"created_at"`
+		Draft     bool      `json:"draft"`
 		User      struct {
 			Login string `json:"login"`
 		} `json:"user"`
@@ -113,13 +114,17 @@ func fetchPRs(repo *Repo) ([]pullRequest, error) {
 	prs := make([]pullRequest, 0, len(raw)+len(active))
 	for _, r := range raw {
 		seen[r.Number] = true
+		status := "open"
+		if r.Draft {
+			status = "draft"
+		}
 		prs = append(prs, pullRequest{
 			Number:    r.Number,
 			Title:     r.Title,
 			Author:    r.User.Login,
 			CreatedAt: r.CreatedAt,
 			InReview:  active[r.Number],
-			Status:    "open",
+			Status:    status,
 		})
 	}
 
