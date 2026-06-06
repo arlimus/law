@@ -177,7 +177,15 @@ func reviewPath(repo *Repo, prNumber int) string {
 }
 
 func removeReview(repo *Repo, prNumber int) error {
-	return os.RemoveAll(reviewPath(repo, prNumber))
+	path := reviewPath(repo, prNumber)
+	remove := exec.Command("git", "worktree", "remove", "--force", path)
+	remove.Dir = repo.Path
+	if out, err := remove.CombinedOutput(); err != nil {
+		if _, statErr := os.Stat(path); statErr == nil {
+			return fmt.Errorf("git worktree remove: %v\n%s", err, strings.TrimSpace(string(out)))
+		}
+	}
+	return os.RemoveAll(path)
 }
 
 func startReview(repo *Repo, prNumber int) (string, error) {
@@ -190,9 +198,10 @@ func startReview(repo *Repo, prNumber int) (string, error) {
 		return path, nil
 	}
 
-	clone := exec.Command("git", "clone", repo.URL, path)
-	if out, err := clone.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("git clone: %v\n%s", err, strings.TrimSpace(string(out)))
+	worktree := exec.Command("git", "worktree", "add", "--detach", path)
+	worktree.Dir = repo.Path
+	if out, err := worktree.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("git worktree add: %v\n%s", err, strings.TrimSpace(string(out)))
 	}
 
 	checkout := exec.Command("gh", "pr", "checkout", strconv.Itoa(prNumber))
