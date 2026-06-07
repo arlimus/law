@@ -20,6 +20,11 @@ type pullRequest struct {
 	CreatedAt time.Time
 	InReview  bool
 	Status    string // "open", "draft", "merged", "closed", "unknown"
+	// Path is the worktree backing this PR locally, when one exists. Set live
+	// by refreshBranches; not parsed from the gh API. May be a .review<N>
+	// directory (from `gh pr checkout`) or a .branch-<x> directory (when the
+	// PR was opened from a branch workspace via "push and open PR").
+	Path string
 }
 
 // workspace is a worktree directory under a repo root, either backing a PR
@@ -258,10 +263,6 @@ func reviewPath(repo *Repo, prNumber int) string {
 	return filepath.Join(repo.Path, fmt.Sprintf("%s%d", reviewPrefix, prNumber))
 }
 
-func removeReview(repo *Repo, prNumber int) error {
-	return removeWorkspace(repo, reviewPath(repo, prNumber))
-}
-
 func removeWorkspace(repo *Repo, path string) error {
 	remove := exec.Command("git", "worktree", "remove", "--force", path)
 	remove.Dir = repo.Path
@@ -340,15 +341,6 @@ func startBranch(repo *Repo, branchName string) (string, error) {
 		return "", fmt.Errorf("git worktree add: %v\n%s", err, strings.TrimSpace(string(out)))
 	}
 	return path, nil
-}
-
-// moveWorkspace renames a worktree directory via `git worktree move`.
-func moveWorkspace(repo *Repo, oldPath, newPath string) error {
-	cmd := exec.Command("git", "-C", repo.Path, "worktree", "move", oldPath, newPath)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git worktree move: %v\n%s", err, strings.TrimSpace(string(out)))
-	}
-	return nil
 }
 
 func startReview(repo *Repo, prNumber int) (string, error) {

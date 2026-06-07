@@ -2,8 +2,8 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -596,16 +596,22 @@ func (m model) updatePRs(key tea.Key) (tea.Model, tea.Cmd) {
 		}
 		it := items[m.prsCursor]
 		var key wsKey
+		var path string
 		var label string
 		if it.Branch != "" {
 			key = branchKey(it.Branch)
+			path = it.Path
 			label = ".branch-" + sanitizeBranch(it.Branch)
 		} else {
 			if !it.PR.InReview {
 				return m, nil
 			}
 			key = prKey(it.PR.Number)
-			label = fmt.Sprintf(".review%d", it.PR.Number)
+			path = it.PR.Path
+			if path == "" {
+				path = reviewPath(m.currentRepo, it.PR.Number)
+			}
+			label = filepath.Base(path)
 		}
 		if m.confirmDelete != key {
 			m.confirmDelete = key
@@ -614,12 +620,7 @@ func (m model) updatePRs(key tea.Key) (tea.Model, tea.Cmd) {
 		}
 		m.confirmDelete = wsKey{}
 		m.stopWS(key)
-		var delErr error
-		if it.Branch != "" {
-			delErr = removeWorkspace(m.currentRepo, it.Path)
-		} else {
-			delErr = removeReview(m.currentRepo, it.PR.Number)
-		}
+		delErr := removeWorkspace(m.currentRepo, path)
 		if delErr != nil {
 			m.status = "delete failed: " + delErr.Error()
 			return m, nil
@@ -668,37 +669,39 @@ func (m model) visibleWorkspaces() []workspaceItem {
 }
 
 // refreshBranches scans the repo's worktrees and rebuilds m.branches, filtering
-// out any branch that already has a matching PR. For such branches the on-disk
-// directory is migrated from .branch-<x> to .review<N> so subsequent PR-row
-// interactions resolve to the right path.
+// out any branch that already has a matching PR. It also records each PR row's
+// local worktree path (.review<N> from `gh pr checkout`, or .branch-<x> when
+// the PR was opened from a branch workspace), so subsequent PR-row actions
+// resolve to the right directory.
 func (m *model) refreshBranches() {
 	if m.currentRepo == nil {
 		m.branches = nil
 		return
 	}
 	all := listWorkspaces(m.currentRepo)
+	prByNumber := make(map[int]int, len(m.prs))
 	prByBranch := make(map[string]int, len(m.prs))
 	for i, pr := range m.prs {
+		prByNumber[pr.Number] = i
 		if pr.HeadRef != "" {
 			prByBranch[pr.HeadRef] = i
 		}
 	}
 	var branches []workspace
 	for _, w := range all {
+		if w.PRNumber > 0 {
+			if idx, ok := prByNumber[w.PRNumber]; ok {
+				m.prs[idx].Path = w.Path
+				m.prs[idx].InReview = true
+			}
+			continue
+		}
 		if w.Branch == "" {
 			continue
 		}
 		if idx, ok := prByBranch[w.Branch]; ok {
+			m.prs[idx].Path = w.Path
 			m.prs[idx].InReview = true
-			// Rename the worktree to the .review<N> convention if it still
-			// uses the .branch-* layout. Errors are non-fatal — the row still
-			// appears, just at the old path.
-			newPath := reviewPath(m.currentRepo, m.prs[idx].Number)
-			if w.Path != newPath {
-				if err := moveWorkspace(m.currentRepo, w.Path, newPath); err != nil && m.status == "" {
-					m.status = "rename worktree: " + err.Error()
-				}
-			}
 			continue
 		}
 		branches = append(branches, w)
@@ -718,22 +721,10 @@ func (m *model) removeBranchByName(name string) {
 
 // transitionBranchToPR is called when the tick has detected that the branch
 // the user is viewing now has a PR (either created by our push action or
-// externally). It renames the worktree to .review<N>, rekeys the running map,
-// and flips the actions screen into PR mode. It then refreshes the PR list so
-// the row layout settles.
+// externally). It rekeys the running map and flips the actions screen into
+// PR mode. The worktree stays on disk at its current path — usually
+// .branch-<x> — so any open editors/shells inside it keep working.
 func (m model) transitionBranchToPR(branch string, prNumber int) (tea.Model, tea.Cmd) {
-	newPath := reviewPath(m.currentRepo, prNumber)
-	oldPath := m.actionsPath
-	if oldPath != newPath {
-		// refreshBranches may already have renamed the worktree; only attempt
-		// the move when the old path still exists.
-		if _, err := os.Stat(oldPath); err == nil {
-			if err := moveWorkspace(m.currentRepo, oldPath, newPath); err != nil {
-				m.status = "rename worktree: " + err.Error()
-				return m, fetchPRsCmd(m.currentRepo)
-			}
-		}
-	}
 	oldKey := branchKey(branch)
 	newKey := prKey(prNumber)
 	if wsMap, ok := m.running[oldKey]; ok {
@@ -744,18 +735,25 @@ func (m model) transitionBranchToPR(branch string, prNumber int) (tea.Model, tea
 	for i := range m.prs {
 		if m.prs[i].Number == prNumber {
 			m.prs[i].InReview = true
+			m.prs[i].Path = m.actionsPath
 			break
 		}
 	}
 	m.activeWS = newKey
-	m.actionsPath = newPath
 	m.branchCommits = 0
 	m.status = fmt.Sprintf("PR #%d opened", prNumber)
 	return m, fetchPRsCmd(m.currentRepo)
 }
 
 func (m model) openActionsPR(prNumber int) (tea.Model, tea.Cmd) {
-	return m.enterActions(prKey(prNumber), reviewPath(m.currentRepo, prNumber))
+	path := reviewPath(m.currentRepo, prNumber)
+	for i := range m.prs {
+		if m.prs[i].Number == prNumber && m.prs[i].Path != "" {
+			path = m.prs[i].Path
+			break
+		}
+	}
+	return m.enterActions(prKey(prNumber), path)
 }
 
 func (m model) openActionsBranch(branch, path string) (tea.Model, tea.Cmd) {
