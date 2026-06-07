@@ -2,9 +2,12 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -45,7 +48,7 @@ type runningAction struct {
 
 type actionStartedMsg struct {
 	action Action
-	pr     int
+	ws     wsKey
 	index  int
 	pipe   chan ActionEvent
 	cmd    *exec.Cmd
@@ -64,7 +67,19 @@ const (
 	promptNewName
 	promptNewDesc
 	promptEditDesc
+	promptNewBranch
 )
+
+type branchStatusMsg struct {
+	key      wsKey
+	commits  int
+	prNumber int // non-zero if a PR for the branch has appeared
+	err      error
+}
+
+type branchTickMsg struct {
+	key wsKey
+}
 
 type previewsLoadedMsg struct {
 	prNumber int
@@ -79,6 +94,13 @@ type actionGeneratedMsg struct {
 	err     error
 }
 
+// workspaceItem is a row in the workspaces view: either a pre-PR branch or a PR.
+type workspaceItem struct {
+	Branch string       // non-empty for branch row
+	PR     *pullRequest // non-nil for PR row
+	Path   string       // for branch rows, the worktree path
+}
+
 type model struct {
 	cfg     *Config
 	cfgPath string
@@ -89,19 +111,23 @@ type model struct {
 	currentRepo *Repo
 	autoPR      int
 	prs           []pullRequest
+	branches      []workspace // pre-PR local branch workspaces (no matching PR)
 	prsCursor     int
 	prsLoading    bool
 	prsErr        string
-	confirmDelete int
+	confirmDelete wsKey
 
 	actions       []Action
 	actionsCursor int
 	actionsErr    string
-	actionsPR     int
+	activeWS      wsKey
+	actionsPath   string
+
+	branchCommits int // for branch mode: commits ahead of origin/main
 
 	previews map[int][]vercelPreview
 
-	running       map[int]map[int]*runningAction
+	running       map[wsKey]map[int]*runningAction
 	runningExpand bool
 
 	prompt      promptKind
@@ -163,13 +189,13 @@ func startReviewCmd(repo *Repo, prNumber int) tea.Cmd {
 	}
 }
 
-func runActionCmd(action Action, pr, index int, dir string) tea.Cmd {
+func runActionCmd(action Action, ws wsKey, index int, dir string) tea.Cmd {
 	return func() tea.Msg {
 		ch, cmd, err := startAction(action, dir)
 		if err != nil {
-			return actionStartedMsg{action: action, pr: pr, index: index, err: err}
+			return actionStartedMsg{action: action, ws: ws, index: index, err: err}
 		}
-		return actionStartedMsg{action: action, pr: pr, index: index, pipe: ch, cmd: cmd}
+		return actionStartedMsg{action: action, ws: ws, index: index, pipe: ch, cmd: cmd}
 	}
 }
 
@@ -191,6 +217,46 @@ func fetchPreviewsCmd(owner, name string, prNumber int) tea.Cmd {
 	return func() tea.Msg {
 		return previewsLoadedMsg{prNumber: prNumber, previews: fetchVercelPreviews(owner, name, prNumber)}
 	}
+}
+
+func branchStatusCmd(branch, path string, prs []pullRequest) tea.Cmd {
+	key := branchKey(branch)
+	return func() tea.Msg {
+		commits, err := branchCommitCount(path)
+		msg := branchStatusMsg{key: key, commits: commits, err: err}
+		for _, pr := range prs {
+			if pr.HeadRef == branch {
+				msg.prNumber = pr.Number
+				break
+			}
+		}
+		return msg
+	}
+}
+
+func branchTickCmd(key wsKey) tea.Cmd {
+	return tea.Tick(3*time.Second, func(time.Time) tea.Msg { return branchTickMsg{key: key} })
+}
+
+// pushAndOpenPRCmd runs `git push -u origin <branch>` followed by `gh pr create`
+// with title/body taken from the first commit ahead of origin/main. The whole
+// flow streams through the existing runningAction machinery so its stdout is
+// visible in the running panel.
+func pushAndOpenPRCmd(ws wsKey, path, branch string) tea.Cmd {
+	cmd := fmt.Sprintf(`set -e
+git push -u origin %[1]s
+SHA=$(git log origin/main..HEAD --reverse --format=%%H | head -1)
+TITLE=$(git show -s --format=%%s "$SHA")
+BODY=$(git show -s --format=%%b "$SHA")
+gh pr create --title "$TITLE" --body "$BODY"
+`, shellQuote(branch))
+	action := Action{Name: "push and open PR", Command: cmd}
+	return runActionCmd(action, ws, syntheticIndex, path)
+}
+
+// shellQuote wraps s in single quotes, escaping embedded single quotes.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 func waitEventCmd(pipe chan ActionEvent) tea.Cmd {
@@ -221,12 +287,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.prs = msg.prs
 			m.prsErr = ""
-			if m.prsCursor >= len(m.prs) {
-				m.prsCursor = 0
-			}
+		}
+		m.refreshBranches()
+		if m.prsCursor >= len(m.visibleWorkspaces()) {
+			m.prsCursor = 0
 		}
 		if m.status == "refreshing..." {
 			m.status = ""
+		}
+		// If we're sitting on a branch workspace whose PR has just appeared,
+		// transition to PR mode (rename worktree, rekey running map) now —
+		// don't wait for the next 3s tick.
+		if m.activeWS.isBranch() {
+			for _, pr := range m.prs {
+				if pr.HeadRef == m.activeWS.Branch {
+					return m.transitionBranchToPR(m.activeWS.Branch, pr.Number)
+				}
+			}
 		}
 		return m, nil
 
@@ -244,23 +321,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.prs[i].InReview = true
 			}
 		}
-		return m.openActions(msg.prNumber)
+		return m.openActionsPR(msg.prNumber)
 
 	case actionStartedMsg:
 		if m.running == nil {
-			m.running = map[int]map[int]*runningAction{}
+			m.running = map[wsKey]map[int]*runningAction{}
 		}
-		if m.running[msg.pr] == nil {
-			m.running[msg.pr] = map[int]*runningAction{}
+		if m.running[msg.ws] == nil {
+			m.running[msg.ws] = map[int]*runningAction{}
 		}
 		if msg.err != nil {
-			m.running[msg.pr][msg.index] = &runningAction{
+			m.running[msg.ws][msg.index] = &runningAction{
 				Name: msg.action.Name, Command: msg.action.Command,
 				Done: true, Err: msg.err, Code: -1,
 			}
 			return m, nil
 		}
-		m.running[msg.pr][msg.index] = &runningAction{
+		m.running[msg.ws][msg.index] = &runningAction{
 			Name: msg.action.Name, Command: msg.action.Command,
 			pipe: msg.pipe, cmd: msg.cmd,
 		}
@@ -281,9 +358,38 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			r.Done = true
 			r.Code = msg.evt.Code
 			r.Err = msg.evt.Err
+			// If the synthetic push-and-open-PR just completed successfully,
+			// refresh the PR list immediately so the new PR shows up without
+			// waiting for the next 3s tick.
+			if m.activeWS.isBranch() && msg.evt.Err == nil && msg.evt.Code == 0 {
+				if syn, ok := m.running[m.activeWS][syntheticIndex]; ok && syn == r {
+					return m, fetchPRsCmd(m.currentRepo)
+				}
+			}
 			return m, nil
 		}
 		return m, waitEventCmd(msg.pipe)
+
+	case branchStatusMsg:
+		if m.activeWS != msg.key {
+			return m, nil
+		}
+		if msg.err == nil {
+			m.branchCommits = msg.commits
+		}
+		if msg.prNumber != 0 {
+			return m.transitionBranchToPR(msg.key.Branch, msg.prNumber)
+		}
+		return m, nil
+
+	case branchTickMsg:
+		if m.activeWS != msg.key {
+			return m, nil
+		}
+		return m, tea.Batch(
+			branchStatusCmd(msg.key.Branch, m.actionsPath, m.prs),
+			branchTickCmd(msg.key),
+		)
 
 	case previewsLoadedMsg:
 		if m.previews == nil {
@@ -347,8 +453,8 @@ func (m model) quit() (tea.Model, tea.Cmd) {
 }
 
 func (m *model) killAllRunning() {
-	for _, prMap := range m.running {
-		for _, r := range prMap {
+	for _, wsMap := range m.running {
+		for _, r := range wsMap {
 			if r != nil && !r.Done {
 				r.Stopped = true
 				killAction(r.cmd)
@@ -358,8 +464,8 @@ func (m *model) killAllRunning() {
 }
 
 func (m *model) findRunningByPipe(p chan ActionEvent) *runningAction {
-	for _, prMap := range m.running {
-		for _, r := range prMap {
+	for _, wsMap := range m.running {
+		for _, r := range wsMap {
 			if r != nil && r.pipe == p {
 				return r
 			}
@@ -368,8 +474,8 @@ func (m *model) findRunningByPipe(p chan ActionEvent) *runningAction {
 	return nil
 }
 
-func (m model) prHasRunning(prNumber int) bool {
-	for _, r := range m.running[prNumber] {
+func (m model) wsHasRunning(key wsKey) bool {
+	for _, r := range m.running[key] {
 		if r != nil && !r.Done {
 			return true
 		}
@@ -377,8 +483,8 @@ func (m model) prHasRunning(prNumber int) bool {
 	return false
 }
 
-func (m *model) stopPR(prNumber int) {
-	for _, r := range m.running[prNumber] {
+func (m *model) stopWS(key wsKey) {
+	for _, r := range m.running[key] {
 		if r != nil && !r.Done {
 			r.Stopped = true
 			killAction(r.cmd)
@@ -414,17 +520,22 @@ func (m model) updateRepos(key tea.Key) (tea.Model, tea.Cmd) {
 }
 
 func (m model) updatePRs(key tea.Key) (tea.Model, tea.Cmd) {
-	if key.Code != 'd' && m.confirmDelete != 0 {
-		m.confirmDelete = 0
+	if key.Code != 'd' && !m.confirmDelete.isZero() {
+		m.confirmDelete = wsKey{}
 		if strings.HasPrefix(m.status, "press d again") {
 			m.status = ""
 		}
 	}
+	if m.prompt == promptNewBranch {
+		return m.updatePrompt(key)
+	}
+	items := m.visibleWorkspaces()
 	switch key.Code {
 	case tea.KeyEscape:
 		m.screen = screenRepos
 		m.currentRepo = nil
 		m.prs = nil
+		m.branches = nil
 		m.prsCursor = 0
 		m.prsErr = ""
 		m.prsLoading = false
@@ -437,18 +548,31 @@ func (m model) updatePRs(key tea.Key) (tea.Model, tea.Cmd) {
 			m.prsCursor--
 		}
 	case tea.KeyDown, 'j':
-		if m.prsCursor < len(m.prs)-1 {
+		if m.prsCursor < len(items)-1 {
 			m.prsCursor++
 		}
 	case tea.KeyEnter:
-		if m.currentRepo != nil && m.prsCursor < len(m.prs) {
-			pr := m.prs[m.prsCursor]
-			if pr.InReview {
-				return m.openActions(pr.Number)
-			}
-			m.status = fmt.Sprintf("starting review for #%d...", pr.Number)
-			return m, startReviewCmd(m.currentRepo, pr.Number)
+		if m.currentRepo == nil || m.prsCursor >= len(items) {
+			return m, nil
 		}
+		it := items[m.prsCursor]
+		if it.Branch != "" {
+			return m.openActionsBranch(it.Branch, it.Path)
+		}
+		pr := it.PR
+		if pr.InReview {
+			return m.openActionsPR(pr.Number)
+		}
+		m.status = fmt.Sprintf("starting review for #%d...", pr.Number)
+		return m, startReviewCmd(m.currentRepo, pr.Number)
+	case 'n':
+		if m.currentRepo == nil {
+			return m, nil
+		}
+		m.prompt = promptNewBranch
+		m.input = ""
+		m.status = ""
+		return m, nil
 	case 'r':
 		if m.currentRepo != nil && !m.prsLoading {
 			m.prsLoading = true
@@ -457,45 +581,193 @@ func (m model) updatePRs(key tea.Key) (tea.Model, tea.Cmd) {
 			return m, fetchPRsCmd(m.currentRepo)
 		}
 	case 's':
-		if m.prsCursor < len(m.prs) {
-			m.stopPR(m.prs[m.prsCursor].Number)
+		if m.prsCursor < len(items) {
+			it := items[m.prsCursor]
+			if it.Branch != "" {
+				m.stopWS(branchKey(it.Branch))
+			} else {
+				m.stopWS(prKey(it.PR.Number))
+			}
 		}
 		return m, nil
 	case 'd':
-		if m.prsCursor >= len(m.prs) || !m.prs[m.prsCursor].InReview {
+		if m.prsCursor >= len(items) {
 			return m, nil
 		}
-		pr := m.prs[m.prsCursor]
-		if m.confirmDelete != pr.Number {
-			m.confirmDelete = pr.Number
-			m.status = fmt.Sprintf("press d again to delete .review%d", pr.Number)
-			return m, nil
-		}
-		m.confirmDelete = 0
-		m.stopPR(pr.Number)
-		if err := removeReview(m.currentRepo, pr.Number); err != nil {
-			m.status = "delete failed: " + err.Error()
-			return m, nil
-		}
-		delete(m.running, pr.Number)
-		if pr.Status == "open" || pr.Status == "draft" {
-			m.prs[m.prsCursor].InReview = false
+		it := items[m.prsCursor]
+		var key wsKey
+		var label string
+		if it.Branch != "" {
+			key = branchKey(it.Branch)
+			label = ".branch-" + sanitizeBranch(it.Branch)
 		} else {
-			m.prs = append(m.prs[:m.prsCursor], m.prs[m.prsCursor+1:]...)
-			if m.prsCursor >= len(m.prs) && m.prsCursor > 0 {
-				m.prsCursor--
+			if !it.PR.InReview {
+				return m, nil
+			}
+			key = prKey(it.PR.Number)
+			label = fmt.Sprintf(".review%d", it.PR.Number)
+		}
+		if m.confirmDelete != key {
+			m.confirmDelete = key
+			m.status = "press d again to delete " + label
+			return m, nil
+		}
+		m.confirmDelete = wsKey{}
+		m.stopWS(key)
+		var delErr error
+		if it.Branch != "" {
+			delErr = removeWorkspace(m.currentRepo, it.Path)
+		} else {
+			delErr = removeReview(m.currentRepo, it.PR.Number)
+		}
+		if delErr != nil {
+			m.status = "delete failed: " + delErr.Error()
+			return m, nil
+		}
+		delete(m.running, key)
+		if it.Branch != "" {
+			m.removeBranchByName(it.Branch)
+		} else {
+			pr := it.PR
+			if pr.Status == "open" || pr.Status == "draft" {
+				for i := range m.prs {
+					if m.prs[i].Number == pr.Number {
+						m.prs[i].InReview = false
+					}
+				}
+			} else {
+				for i := range m.prs {
+					if m.prs[i].Number == pr.Number {
+						m.prs = append(m.prs[:i], m.prs[i+1:]...)
+						break
+					}
+				}
 			}
 		}
-		m.status = fmt.Sprintf("deleted .review%d", pr.Number)
+		if m.prsCursor >= len(m.visibleWorkspaces()) && m.prsCursor > 0 {
+			m.prsCursor--
+		}
+		m.status = "deleted " + label
 		return m, nil
 	}
 	return m, nil
 }
 
-func (m model) openActions(prNumber int) (tea.Model, tea.Cmd) {
+// visibleWorkspaces returns branch rows (alphabetical) followed by PR rows in the
+// existing descending-number order.
+func (m model) visibleWorkspaces() []workspaceItem {
+	out := make([]workspaceItem, 0, len(m.branches)+len(m.prs))
+	for i := range m.branches {
+		b := m.branches[i]
+		out = append(out, workspaceItem{Branch: b.Branch, Path: b.Path})
+	}
+	for i := range m.prs {
+		out = append(out, workspaceItem{PR: &m.prs[i]})
+	}
+	return out
+}
+
+// refreshBranches scans the repo's worktrees and rebuilds m.branches, filtering
+// out any branch that already has a matching PR. For such branches the on-disk
+// directory is migrated from .branch-<x> to .review<N> so subsequent PR-row
+// interactions resolve to the right path.
+func (m *model) refreshBranches() {
+	if m.currentRepo == nil {
+		m.branches = nil
+		return
+	}
+	all := listWorkspaces(m.currentRepo)
+	prByBranch := make(map[string]int, len(m.prs))
+	for i, pr := range m.prs {
+		if pr.HeadRef != "" {
+			prByBranch[pr.HeadRef] = i
+		}
+	}
+	var branches []workspace
+	for _, w := range all {
+		if w.Branch == "" {
+			continue
+		}
+		if idx, ok := prByBranch[w.Branch]; ok {
+			m.prs[idx].InReview = true
+			// Rename the worktree to the .review<N> convention if it still
+			// uses the .branch-* layout. Errors are non-fatal — the row still
+			// appears, just at the old path.
+			newPath := reviewPath(m.currentRepo, m.prs[idx].Number)
+			if w.Path != newPath {
+				if err := moveWorkspace(m.currentRepo, w.Path, newPath); err != nil && m.status == "" {
+					m.status = "rename worktree: " + err.Error()
+				}
+			}
+			continue
+		}
+		branches = append(branches, w)
+	}
+	sort.Slice(branches, func(i, j int) bool { return branches[i].Branch < branches[j].Branch })
+	m.branches = branches
+}
+
+func (m *model) removeBranchByName(name string) {
+	for i := range m.branches {
+		if m.branches[i].Branch == name {
+			m.branches = append(m.branches[:i], m.branches[i+1:]...)
+			return
+		}
+	}
+}
+
+// transitionBranchToPR is called when the tick has detected that the branch
+// the user is viewing now has a PR (either created by our push action or
+// externally). It renames the worktree to .review<N>, rekeys the running map,
+// and flips the actions screen into PR mode. It then refreshes the PR list so
+// the row layout settles.
+func (m model) transitionBranchToPR(branch string, prNumber int) (tea.Model, tea.Cmd) {
+	newPath := reviewPath(m.currentRepo, prNumber)
+	oldPath := m.actionsPath
+	if oldPath != newPath {
+		// refreshBranches may already have renamed the worktree; only attempt
+		// the move when the old path still exists.
+		if _, err := os.Stat(oldPath); err == nil {
+			if err := moveWorkspace(m.currentRepo, oldPath, newPath); err != nil {
+				m.status = "rename worktree: " + err.Error()
+				return m, fetchPRsCmd(m.currentRepo)
+			}
+		}
+	}
+	oldKey := branchKey(branch)
+	newKey := prKey(prNumber)
+	if wsMap, ok := m.running[oldKey]; ok {
+		m.running[newKey] = wsMap
+		delete(m.running, oldKey)
+	}
+	m.removeBranchByName(branch)
+	for i := range m.prs {
+		if m.prs[i].Number == prNumber {
+			m.prs[i].InReview = true
+			break
+		}
+	}
+	m.activeWS = newKey
+	m.actionsPath = newPath
+	m.branchCommits = 0
+	m.status = fmt.Sprintf("PR #%d opened", prNumber)
+	return m, fetchPRsCmd(m.currentRepo)
+}
+
+func (m model) openActionsPR(prNumber int) (tea.Model, tea.Cmd) {
+	return m.enterActions(prKey(prNumber), reviewPath(m.currentRepo, prNumber))
+}
+
+func (m model) openActionsBranch(branch, path string) (tea.Model, tea.Cmd) {
+	return m.enterActions(branchKey(branch), path)
+}
+
+func (m model) enterActions(key wsKey, path string) (tea.Model, tea.Cmd) {
 	m.screen = screenActions
-	m.actionsPR = prNumber
+	m.activeWS = key
+	m.actionsPath = path
 	m.actionsCursor = 0
+	m.branchCommits = 0
 	cfg, err := loadRepoConfig(m.currentRepo.Path)
 	if err != nil {
 		m.actionsErr = err.Error()
@@ -504,13 +776,53 @@ func (m model) openActions(prNumber int) (tea.Model, tea.Cmd) {
 		m.actions = cfg.Actions
 		m.actionsErr = ""
 	}
-	var cmd tea.Cmd
-	if _, cached := m.previews[prNumber]; !cached {
-		if owner, repo, ok := m.currentRepo.ownerRepo(); ok {
-			cmd = fetchPreviewsCmd(owner, repo, prNumber)
+	var cmds []tea.Cmd
+	if key.isPR() {
+		if _, cached := m.previews[key.PRNumber]; !cached {
+			if owner, repo, ok := m.currentRepo.ownerRepo(); ok {
+				cmds = append(cmds, fetchPreviewsCmd(owner, repo, key.PRNumber))
+			}
 		}
 	}
-	return m, cmd
+	if key.isBranch() {
+		cmds = append(cmds, branchStatusCmd(key.Branch, path, m.prs))
+		cmds = append(cmds, branchTickCmd(key))
+	}
+	if len(cmds) == 0 {
+		return m, nil
+	}
+	return m, tea.Batch(cmds...)
+}
+
+// syntheticIndex returns the running-map index reserved for the synthetic
+// "push and open PR" row. It sits beyond the user-action indices so it can't
+// collide with them as the user adds/removes actions.
+const syntheticIndex = -1
+
+// hasSynthetic reports whether the actions list currently shows a synthetic
+// top row (branch mode only).
+func (m model) hasSynthetic() bool {
+	return m.activeWS.isBranch()
+}
+
+func (m model) actionRowCount() int {
+	n := len(m.actions)
+	if m.hasSynthetic() {
+		n++
+	}
+	return n
+}
+
+// userActionIndex converts a visible cursor index into m.actions index, or
+// -1 if the cursor points at the synthetic row.
+func (m model) userActionIndex(cursor int) int {
+	if m.hasSynthetic() {
+		if cursor == 0 {
+			return -1
+		}
+		return cursor - 1
+	}
+	return cursor
 }
 
 func (m model) updateActions(key tea.Key) (tea.Model, tea.Cmd) {
@@ -539,7 +851,9 @@ func (m model) updateActions(key tea.Key) (tea.Model, tea.Cmd) {
 		m.actions = nil
 		m.actionsCursor = 0
 		m.actionsErr = ""
-		m.actionsPR = 0
+		m.activeWS = wsKey{}
+		m.actionsPath = ""
+		m.branchCommits = 0
 		m.genErr = ""
 		m.inspecting = false
 		return m, nil
@@ -550,7 +864,7 @@ func (m model) updateActions(key tea.Key) (tea.Model, tea.Cmd) {
 			m.actionsCursor--
 		}
 	case tea.KeyDown, 'j':
-		if m.actionsCursor < len(m.actions)-1 {
+		if m.actionsCursor < m.actionRowCount()-1 {
 			m.actionsCursor++
 		}
 	case 'n':
@@ -559,31 +873,49 @@ func (m model) updateActions(key tea.Key) (tea.Model, tea.Cmd) {
 		m.genErr = ""
 		return m, nil
 	case 'e':
-		if m.actionsCursor < len(m.actions) {
+		ui := m.userActionIndex(m.actionsCursor)
+		if ui >= 0 && ui < len(m.actions) {
 			m.prompt = promptEditDesc
-			m.editIndex = m.actionsCursor
+			m.editIndex = ui
 			m.input = ""
 			m.genErr = ""
 		}
 		return m, nil
 	case 'i':
-		if m.actionsCursor < len(m.actions) {
+		ui := m.userActionIndex(m.actionsCursor)
+		if ui >= 0 && ui < len(m.actions) {
 			m.inspecting = !m.inspecting
 		}
 		return m, nil
 	case tea.KeyEnter:
-		if m.actionsCursor >= len(m.actions) {
+		if m.hasSynthetic() && m.actionsCursor == 0 {
+			if m.branchCommits == 0 {
+				return m, nil
+			}
+			if r, ok := m.running[m.activeWS][syntheticIndex]; ok && !r.Done {
+				return m, nil
+			}
+			m.runningExpand = false
+			return m, pushAndOpenPRCmd(m.activeWS, m.actionsPath, m.activeWS.Branch)
+		}
+		ui := m.userActionIndex(m.actionsCursor)
+		if ui < 0 || ui >= len(m.actions) {
 			return m, nil
 		}
-		if r, ok := m.running[m.actionsPR][m.actionsCursor]; ok && !r.Done {
+		if r, ok := m.running[m.activeWS][ui]; ok && !r.Done {
 			return m, nil
 		}
-		action := m.actions[m.actionsCursor]
+		action := m.actions[ui]
 		m.runningExpand = false
-		dir := reviewPath(m.currentRepo, m.actionsPR)
-		return m, runActionCmd(action, m.actionsPR, m.actionsCursor, dir)
+		return m, runActionCmd(action, m.activeWS, ui, m.actionsPath)
 	case 's':
-		if r, ok := m.running[m.actionsPR][m.actionsCursor]; ok && !r.Done {
+		var idx int
+		if m.hasSynthetic() && m.actionsCursor == 0 {
+			idx = syntheticIndex
+		} else {
+			idx = m.userActionIndex(m.actionsCursor)
+		}
+		if r, ok := m.running[m.activeWS][idx]; ok && !r.Done {
 			r.Stopped = true
 			killAction(r.cmd)
 		}
@@ -593,25 +925,32 @@ func (m model) updateActions(key tea.Key) (tea.Model, tea.Cmd) {
 }
 
 func (m model) moveAction(delta int) (tea.Model, tea.Cmd) {
-	i := m.actionsCursor
-	j := i + delta
-	if i < 0 || i >= len(m.actions) || j < 0 || j >= len(m.actions) {
+	ui := m.userActionIndex(m.actionsCursor)
+	if ui < 0 {
 		return m, nil
 	}
-	m.actions[i], m.actions[j] = m.actions[j], m.actions[i]
-	if prMap := m.running[m.actionsPR]; prMap != nil {
-		ri, hasI := prMap[i]
-		rj, hasJ := prMap[j]
-		delete(prMap, i)
-		delete(prMap, j)
+	uj := ui + delta
+	if uj < 0 || uj >= len(m.actions) {
+		return m, nil
+	}
+	m.actions[ui], m.actions[uj] = m.actions[uj], m.actions[ui]
+	if wsMap := m.running[m.activeWS]; wsMap != nil {
+		ri, hasI := wsMap[ui]
+		rj, hasJ := wsMap[uj]
+		delete(wsMap, ui)
+		delete(wsMap, uj)
 		if hasI {
-			prMap[j] = ri
+			wsMap[uj] = ri
 		}
 		if hasJ {
-			prMap[i] = rj
+			wsMap[ui] = rj
 		}
 	}
-	m.actionsCursor = j
+	if m.hasSynthetic() {
+		m.actionsCursor = uj + 1
+	} else {
+		m.actionsCursor = uj
+	}
 	if err := saveRepoConfig(m.currentRepo.Path, &RepoConfig{Actions: m.actions}); err != nil {
 		m.genErr = "save: " + err.Error()
 	}
@@ -644,8 +983,35 @@ func (m model) updatePrompt(key tea.Key) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m model) submitNewBranch(name string) (tea.Model, tea.Cmd) {
+	m.prompt = promptNone
+	m.input = ""
+	if err := validateBranchName(name); err != nil {
+		m.status = err.Error()
+		return m, nil
+	}
+	if exists, err := branchExists(m.currentRepo, name); err != nil {
+		m.status = "check existing branches: " + err.Error()
+		return m, nil
+	} else if exists {
+		m.status = fmt.Sprintf("branch %q already exists locally or on origin", name)
+		return m, nil
+	}
+	path, err := startBranch(m.currentRepo, name)
+	if err != nil {
+		m.status = "create branch: " + err.Error()
+		return m, nil
+	}
+	m.branches = append(m.branches, workspace{Branch: name, Path: path})
+	sort.Slice(m.branches, func(i, j int) bool { return m.branches[i].Branch < m.branches[j].Branch })
+	m.status = "created branch " + name
+	return m.openActionsBranch(name, path)
+}
+
 func (m model) submitPrompt(v string) (tea.Model, tea.Cmd) {
 	switch m.prompt {
+	case promptNewBranch:
+		return m.submitNewBranch(v)
 	case promptNewName:
 		m.pendingName = v
 		m.input = ""
@@ -700,6 +1066,7 @@ const (
 	mergedIcon = "" // nf-oct-git_merge
 	closedIcon = "" // nf-oct-git_pull_request_closed
 	draftIcon  = "⏹"
+	branchIcon = "" // nf-oct-git_branch
 )
 
 // githubIcon is the Nerd Fonts FontAwesome github glyph (nf-fa-github, U+F09B).
@@ -754,37 +1121,63 @@ func (m model) renderPRs() string {
 	}
 	b.WriteString(titleStyle.Render(header) + "\n\n")
 
+	items := m.visibleWorkspaces()
 	switch {
-	case m.prsLoading && len(m.prs) == 0 && m.prsErr == "":
+	case m.prsLoading && len(items) == 0 && m.prsErr == "":
 		b.WriteString(dimStyle.Render("  loading...") + "\n")
 	case m.prsErr != "":
 		b.WriteString(warnStyle.Render("  "+m.prsErr) + "\n")
-	case len(m.prs) == 0:
+	case len(items) == 0:
 		b.WriteString(dimStyle.Render("  no open PRs") + "\n")
 	default:
 		numWidth, agoWidth := 1, 0
-		agos := make([]string, len(m.prs))
-		for i, pr := range m.prs {
-			if w := len(strconv.Itoa(pr.Number)); w > numWidth {
+		for _, it := range items {
+			if it.PR == nil {
+				continue
+			}
+			if w := len(strconv.Itoa(it.PR.Number)); w > numWidth {
 				numWidth = w
 			}
-			agos[i] = humanizeAgo(pr.CreatedAt)
-			if len(agos[i]) > agoWidth {
-				agoWidth = len(agos[i])
+			if w := len(humanizeAgo(it.PR.CreatedAt)); w > agoWidth {
+				agoWidth = w
 			}
 		}
-		for i, pr := range m.prs {
+		owner, repoName, ownerOK := "", "", false
+		if m.currentRepo != nil {
+			owner, repoName, ownerOK = m.currentRepo.ownerRepo()
+		}
+		for i, it := range items {
 			cursor := "  "
+			if i == m.prsCursor {
+				cursor = cursorStyle.Render("▸ ")
+			}
+			if it.Branch != "" {
+				mark := markStyle.Render("*") + " "
+				if m.wsHasRunning(branchKey(it.Branch)) {
+					mark = markStyle.Render("*") + flashStyle.Render("●")
+				}
+				agoPad := dimStyle.Render(strings.Repeat(" ", agoWidth))
+				numPad := strings.Repeat(" ", numWidth)
+				name := it.Branch
+				if i == m.prsCursor {
+					name = selectedStyle.Render(name)
+				}
+				icon := dimStyle.Render(branchIcon) + " "
+				line := cursor + mark + " " + agoPad + "  " + icon + numPad + " " + name
+				b.WriteString(line + "\n")
+				continue
+			}
+			pr := it.PR
 			mark := "  "
 			if pr.InReview {
-				if m.prHasRunning(pr.Number) {
+				if m.wsHasRunning(prKey(pr.Number)) {
 					mark = markStyle.Render("*") + flashStyle.Render("●")
 				} else {
 					mark = markStyle.Render("*") + " "
 				}
 			}
 			numStr := fmt.Sprintf("%*d", numWidth, pr.Number)
-			ago := dimStyle.Render(fmt.Sprintf("%*s", agoWidth, agos[i]))
+			ago := dimStyle.Render(fmt.Sprintf("%*s", agoWidth, humanizeAgo(pr.CreatedAt)))
 			statusIcon := "  "
 			switch pr.Status {
 			case "merged":
@@ -796,12 +1189,11 @@ func (m model) renderPRs() string {
 			}
 			rest := ": " + pr.Title
 			if i == m.prsCursor {
-				cursor = cursorStyle.Render("▸ ")
 				numStr = selectedStyle.Render(numStr)
 				rest = selectedStyle.Render(rest)
 			}
-			if owner, repo, ok := m.currentRepo.ownerRepo(); ok {
-				numStr = hyperlink(fmt.Sprintf("https://github.com/%s/%s/pull/%d", owner, repo, pr.Number), numStr)
+			if ownerOK {
+				numStr = hyperlink(fmt.Sprintf("https://github.com/%s/%s/pull/%d", owner, repoName, pr.Number), numStr)
 			}
 			line := cursor + mark + " " + ago + "  " + statusIcon + numStr + rest
 			if pr.Author != "" {
@@ -811,34 +1203,70 @@ func (m model) renderPRs() string {
 		}
 	}
 
-	if m.status != "" {
+	if m.prompt == promptNewBranch {
+		b.WriteString("\n" + renderPrompt(m))
+	} else if m.status != "" {
 		b.WriteString("\n" + flashStyle.Render(m.status) + "\n")
 	}
-	b.WriteString("\n" + dimStyle.Render("↑/↓: navigate • enter: start review • r: refresh • s: stop running • d: delete folder • esc: back • q: quit") + "\n")
+	help := "↑/↓: navigate • enter: open • n: new branch • r: refresh • s: stop running • d: delete folder • esc: back • q: quit"
+	if m.prompt == promptNewBranch {
+		help = "enter: submit • esc: cancel"
+	}
+	b.WriteString("\n" + dimStyle.Render(help) + "\n")
 	return b.String()
 }
 
 func (m model) renderActions() string {
 	var b strings.Builder
 	if m.currentRepo != nil {
-		if owner, repo, ok := m.currentRepo.ownerRepo(); ok {
-			b.WriteString(titleStyle.Render(fmt.Sprintf("law - %s %s/%s #%d", githubIcon, owner, repo, m.actionsPR)) + "\n")
-			b.WriteString(dimStyle.Render(fmt.Sprintf("https://github.com/%s/%s/pull/%d", owner, repo, m.actionsPR)) + "\n")
-		} else {
-			b.WriteString(titleStyle.Render(fmt.Sprintf("law - %s %s #%d", githubIcon, m.currentRepo.URL, m.actionsPR)) + "\n")
+		owner, repo, ownerOK := m.currentRepo.ownerRepo()
+		switch {
+		case m.activeWS.isBranch():
+			label := m.currentRepo.URL
+			if ownerOK {
+				label = owner + "/" + repo
+			}
+			b.WriteString(titleStyle.Render(fmt.Sprintf("law - %s %s %s", githubIcon, label, m.activeWS.Branch)) + "\n")
+		case ownerOK:
+			b.WriteString(titleStyle.Render(fmt.Sprintf("law - %s %s/%s #%d", githubIcon, owner, repo, m.activeWS.PRNumber)) + "\n")
+			b.WriteString(dimStyle.Render(fmt.Sprintf("https://github.com/%s/%s/pull/%d", owner, repo, m.activeWS.PRNumber)) + "\n")
+		default:
+			b.WriteString(titleStyle.Render(fmt.Sprintf("law - %s %s #%d", githubIcon, m.currentRepo.URL, m.activeWS.PRNumber)) + "\n")
 		}
-		for _, p := range m.previews[m.actionsPR] {
-			b.WriteString(hyperlink(p.URL, authorStyle.Render(previewIcon)+" preview: "+p.Name) + "\n")
+		if m.activeWS.isPR() {
+			for _, p := range m.previews[m.activeWS.PRNumber] {
+				b.WriteString(hyperlink(p.URL, authorStyle.Render(previewIcon)+" preview: "+p.Name) + "\n")
+			}
 		}
 		b.WriteString("\n")
 	} else {
 		b.WriteString(titleStyle.Render("law - actions") + "\n\n")
 	}
 
+	wsMap := m.running[m.activeWS]
+	rowIdx := 0
+	if m.hasSynthetic() {
+		cursor := "  "
+		if m.actionsCursor == 0 {
+			cursor = cursorStyle.Render("▸ ")
+		}
+		var label string
+		if m.branchCommits == 0 {
+			label = dimStyle.Render("waiting for commits")
+		} else {
+			label = "push and open PR"
+			if m.actionsCursor == 0 {
+				label = selectedStyle.Render(label)
+			}
+		}
+		b.WriteString(cursor + runMarker(wsMap[syntheticIndex]) + " " + label + "\n")
+		rowIdx = 1
+	}
+
 	switch {
 	case m.actionsErr != "":
 		b.WriteString(warnStyle.Render("  "+m.actionsErr) + "\n")
-	case len(m.actions) == 0:
+	case len(m.actions) == 0 && !m.hasSynthetic():
 		b.WriteString(dimStyle.Render("  no actions configured") + "\n")
 		if m.currentRepo != nil {
 			b.WriteString(dimStyle.Render("  define them in "+repoConfigPath(m.currentRepo.Path)) + "\n")
@@ -847,20 +1275,27 @@ func (m model) renderActions() string {
 		for i, a := range m.actions {
 			cursor := "  "
 			text := a.Name
-			if i == m.actionsCursor {
+			if rowIdx+i == m.actionsCursor {
 				cursor = cursorStyle.Render("▸ ")
 				text = selectedStyle.Render(text)
 			}
-			b.WriteString(cursor + runMarker(m.running[m.actionsPR][i]) + " " + text + "\n")
+			b.WriteString(cursor + runMarker(wsMap[i]) + " " + text + "\n")
 		}
 	}
 
-	if m.inspecting && m.actionsCursor < len(m.actions) {
-		b.WriteString("\n" + renderInspectPanel(m.actions[m.actionsCursor]))
+	ui := m.userActionIndex(m.actionsCursor)
+	if m.inspecting && ui >= 0 && ui < len(m.actions) {
+		b.WriteString("\n" + renderInspectPanel(m.actions[ui]))
 	}
 
-	if r, ok := m.running[m.actionsPR][m.actionsCursor]; ok && r != nil {
-		b.WriteString("\n" + renderRunningPanel(r, m.runningExpand))
+	var activeRunning *runningAction
+	if m.hasSynthetic() && m.actionsCursor == 0 {
+		activeRunning = wsMap[syntheticIndex]
+	} else if ui >= 0 {
+		activeRunning = wsMap[ui]
+	}
+	if activeRunning != nil {
+		b.WriteString("\n" + renderRunningPanel(activeRunning, m.runningExpand))
 	}
 
 	if m.prompt != promptNone {
@@ -884,7 +1319,7 @@ func (m model) renderActions() string {
 		help = "waiting for claude..."
 	default:
 		base := "↑/↓: navigate • enter: run • s: stop • n: new • e: edit • " + inspectHint
-		if r, ok := m.running[m.actionsPR][m.actionsCursor]; ok && r != nil {
+		if activeRunning != nil {
 			base += " • ctrl+o: expand"
 		}
 		help = base + " • esc: back • q: quit"
@@ -909,6 +1344,8 @@ func renderInspectPanel(a Action) string {
 func renderPrompt(m model) string {
 	var label string
 	switch m.prompt {
+	case promptNewBranch:
+		label = "name for new branch (slashes encouraged, e.g. dom/fix-this):"
 	case promptNewName:
 		label = "name for the new action:"
 	case promptNewDesc:

@@ -16,10 +16,31 @@ type pullRequest struct {
 	Number    int
 	Title     string
 	Author    string
+	HeadRef   string
 	CreatedAt time.Time
 	InReview  bool
 	Status    string // "open", "draft", "merged", "closed", "unknown"
 }
+
+// workspace is a worktree directory under a repo root, either backing a PR
+// review (.review<N>) or a pre-PR local branch (.branch-*).
+type workspace struct {
+	Path     string
+	Branch   string // empty for PR workspaces
+	PRNumber int    // 0 for branch workspaces
+}
+
+// wsKey identifies a workspace within the model. Exactly one field is set.
+type wsKey struct {
+	PRNumber int
+	Branch   string
+}
+
+func prKey(n int) wsKey     { return wsKey{PRNumber: n} }
+func branchKey(b string) wsKey { return wsKey{Branch: b} }
+func (k wsKey) isZero() bool   { return k.PRNumber == 0 && k.Branch == "" }
+func (k wsKey) isBranch() bool { return k.Branch != "" }
+func (k wsKey) isPR() bool     { return k.PRNumber > 0 }
 
 // humanizeAgo renders a past duration as a short relative string like "3d" or "2mo".
 func humanizeAgo(t time.Time) string {
@@ -45,7 +66,10 @@ func humanizeAgo(t time.Time) string {
 	}
 }
 
-const reviewPrefix = ".review"
+const (
+	reviewPrefix = ".review"
+	branchPrefix = ".branch-"
+)
 
 func parseReviewDir(name string) (int, bool) {
 	if !strings.HasPrefix(name, reviewPrefix) {
@@ -76,6 +100,56 @@ func inProgressReviews(repoPath string) []int {
 	return nums
 }
 
+// sanitizeBranch converts a branch name into a flat directory-safe form by
+// replacing "/" with "--". The reverse mapping is recovered live from git, so
+// this only needs to be deterministic — not invertible.
+func sanitizeBranch(name string) string {
+	return strings.ReplaceAll(name, "/", "--")
+}
+
+func branchWorkspacePath(repo *Repo, branchName string) string {
+	return filepath.Join(repo.Path, branchPrefix+sanitizeBranch(branchName))
+}
+
+// listWorkspaces enumerates all worktree directories directly under repo.Path
+// (both PR reviews and pre-PR branches). For branch workspaces the actual
+// branch name is read back from git so it survives any folder-name sanitization.
+func listWorkspaces(repo *Repo) []workspace {
+	entries, err := os.ReadDir(repo.Path)
+	if err != nil {
+		return nil
+	}
+	var out []workspace
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		path := filepath.Join(repo.Path, name)
+		if n, ok := parseReviewDir(name); ok {
+			out = append(out, workspace{Path: path, PRNumber: n})
+			continue
+		}
+		if strings.HasPrefix(name, branchPrefix) {
+			branch := readWorktreeBranch(path)
+			if branch == "" {
+				continue
+			}
+			out = append(out, workspace{Path: path, Branch: branch})
+		}
+	}
+	return out
+}
+
+func readWorktreeBranch(path string) string {
+	cmd := exec.Command("git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
 func fetchPRs(repo *Repo) ([]pullRequest, error) {
 	owner, name, ok := repo.ownerRepo()
 	if !ok {
@@ -100,6 +174,9 @@ func fetchPRs(repo *Repo) ([]pullRequest, error) {
 		User      struct {
 			Login string `json:"login"`
 		} `json:"user"`
+		Head struct {
+			Ref string `json:"ref"`
+		} `json:"head"`
 	}
 	if err := json.Unmarshal(out, &raw); err != nil {
 		return nil, fmt.Errorf("parsing gh output: %w", err)
@@ -122,6 +199,7 @@ func fetchPRs(repo *Repo) ([]pullRequest, error) {
 			Number:    r.Number,
 			Title:     r.Title,
 			Author:    r.User.Login,
+			HeadRef:   r.Head.Ref,
 			CreatedAt: r.CreatedAt,
 			InReview:  active[r.Number],
 			Status:    status,
@@ -154,6 +232,9 @@ func fetchClosedPR(owner, name string, number int) pullRequest {
 		User      struct {
 			Login string `json:"login"`
 		} `json:"user"`
+		Head struct {
+			Ref string `json:"ref"`
+		} `json:"head"`
 	}
 	if err := json.Unmarshal(out, &r); err != nil {
 		return pullRequest{Number: number, Title: "(parse error)", InReview: true, Status: "unknown"}
@@ -166,6 +247,7 @@ func fetchClosedPR(owner, name string, number int) pullRequest {
 		Number:    r.Number,
 		Title:     r.Title,
 		Author:    r.User.Login,
+		HeadRef:   r.Head.Ref,
 		CreatedAt: r.CreatedAt,
 		InReview:  true,
 		Status:    status,
@@ -177,7 +259,10 @@ func reviewPath(repo *Repo, prNumber int) string {
 }
 
 func removeReview(repo *Repo, prNumber int) error {
-	path := reviewPath(repo, prNumber)
+	return removeWorkspace(repo, reviewPath(repo, prNumber))
+}
+
+func removeWorkspace(repo *Repo, path string) error {
 	remove := exec.Command("git", "worktree", "remove", "--force", path)
 	remove.Dir = repo.Path
 	if out, err := remove.CombinedOutput(); err != nil {
@@ -186,6 +271,84 @@ func removeReview(repo *Repo, prNumber int) error {
 		}
 	}
 	return os.RemoveAll(path)
+}
+
+// validateBranchName runs `git check-ref-format --branch` so the user can't
+// pick names git itself would refuse later.
+func validateBranchName(name string) error {
+	if name == "" {
+		return fmt.Errorf("branch name required")
+	}
+	cmd := exec.Command("git", "check-ref-format", "--branch", name)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			msg = err.Error()
+		}
+		return fmt.Errorf("invalid branch name: %s", msg)
+	}
+	return nil
+}
+
+// branchExists returns true if name matches either a local branch or a remote
+// tracking branch under origin/.
+func branchExists(repo *Repo, name string) (bool, error) {
+	cmd := exec.Command("git", "-C", repo.Path, "for-each-ref",
+		"--format=%(refname:short)",
+		"refs/heads/"+name,
+		"refs/remotes/origin/"+name,
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		return false, fmt.Errorf("git for-each-ref: %w", err)
+	}
+	return strings.TrimSpace(string(out)) != "", nil
+}
+
+// branchCommitCount counts commits in the worktree that are ahead of origin/main.
+func branchCommitCount(workspacePath string) (int, error) {
+	cmd := exec.Command("git", "-C", workspacePath, "rev-list", "--count", "origin/main..HEAD")
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, fmt.Errorf("git rev-list: %w", err)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0, fmt.Errorf("parse commit count: %w", err)
+	}
+	return n, nil
+}
+
+// startBranch creates a new worktree for branchName, branched off origin/main.
+// It fetches origin first so the base is up-to-date.
+func startBranch(repo *Repo, branchName string) (string, error) {
+	if info, err := os.Stat(repo.Path); err != nil || !info.IsDir() {
+		return "", fmt.Errorf("repo path missing: %s", repo.Path)
+	}
+	path := branchWorkspacePath(repo, branchName)
+	if _, err := os.Stat(path); err == nil {
+		return "", fmt.Errorf("workspace already exists: %s", path)
+	}
+
+	fetch := exec.Command("git", "-C", repo.Path, "fetch", "origin")
+	if out, err := fetch.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("git fetch origin: %v\n%s", err, strings.TrimSpace(string(out)))
+	}
+
+	worktree := exec.Command("git", "-C", repo.Path, "worktree", "add", "-b", branchName, path, "origin/main")
+	if out, err := worktree.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("git worktree add: %v\n%s", err, strings.TrimSpace(string(out)))
+	}
+	return path, nil
+}
+
+// moveWorkspace renames a worktree directory via `git worktree move`.
+func moveWorkspace(repo *Repo, oldPath, newPath string) error {
+	cmd := exec.Command("git", "-C", repo.Path, "worktree", "move", oldPath, newPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git worktree move: %v\n%s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 func startReview(repo *Repo, prNumber int) (string, error) {
