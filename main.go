@@ -20,16 +20,20 @@ func main() {
 	}
 
 	var flash string
-	if repo, ok := detectLocalRepo(); ok && !cfg.hasRepoURL(repo.URL) {
-		cfg.Repos = append(cfg.Repos, repo)
-		if err := saveConfig(cfg, cfgPath); err != nil {
-			fmt.Fprintf(os.Stderr, "save config: %v\n", err)
-			os.Exit(1)
+	var autoRepo *Repo
+	if repo, ok := detectLocalRepo(); ok {
+		if !cfg.hasRepoURL(repo.URL) {
+			cfg.Repos = append(cfg.Repos, repo)
+			if err := saveConfig(cfg, cfgPath); err != nil {
+				fmt.Fprintf(os.Stderr, "save config: %v\n", err)
+				os.Exit(1)
+			}
+			flash = "added repo: " + repo.URL
 		}
-		flash = "added repo: " + repo.URL
+		// Skip repo selection: jump straight to the repo we're running in.
+		autoRepo = cfg.findRepoByURL(repo.URL)
 	}
 
-	var autoRepo *Repo
 	var autoPR int
 	if len(os.Args) == 2 {
 		pr, err := parsePR(os.Args[1])
