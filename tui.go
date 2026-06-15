@@ -1331,7 +1331,23 @@ func (m model) renderActions() string {
 		activeRunning = wsMap[ui]
 	}
 	if activeRunning != nil {
-		b.WriteString("\n" + renderRunningPanel(activeRunning, m.runningExpand))
+		// Bound the panel to the height left on screen so an expanded log
+		// (ctrl+o) shows the most recent lines that fit instead of spilling
+		// past the bottom of the TUI. avail == -1 means the terminal size
+		// isn't known yet, so the panel falls back to showing everything.
+		avail := -1
+		if m.height > 0 {
+			used := strings.Count(b.String(), "\n") + 1 // +1 for the blank line before the panel
+			below := 2                                  // blank + help line
+			if m.prompt != promptNone || m.generating {
+				below += 2
+			}
+			if m.genErr != "" {
+				below += 2
+			}
+			avail = max(m.height-used-below, 0)
+		}
+		b.WriteString("\n" + renderRunningPanel(activeRunning, m.runningExpand, avail))
 	}
 
 	if m.prompt != promptNone {
@@ -1413,7 +1429,11 @@ func runMarker(r *runningAction) string {
 	}
 }
 
-func renderRunningPanel(r *runningAction, expand bool) string {
+// renderRunningPanel renders a running action's status and a tail of its log
+// output. avail is the number of terminal lines the panel may occupy; it is
+// honored only when expanded (collapsed always shows a short 3-line tail), and
+// avail < 0 means the terminal size isn't known yet so everything is shown.
+func renderRunningPanel(r *runningAction, expand bool, avail int) string {
 	var b strings.Builder
 
 	var status string
@@ -1435,14 +1455,23 @@ func renderRunningPanel(r *runningAction, expand bool) string {
 	b.WriteString(dimStyle.Render("$ "+r.Command) + "\n")
 
 	lines := r.Lines
-	const tailN = 3
-	hidden := 0
-	if !expand && len(lines) > tailN {
-		hidden = len(lines) - tailN
-		lines = lines[hidden:]
+	// Decide how many trailing log lines to show. Collapsed shows a short
+	// tail; expanded shows as many of the most recent lines as fit, reserving
+	// the 2-line status+command header and 1 line for the "… earlier" marker.
+	show := len(lines)
+	if !expand {
+		show = min(show, 3)
+	} else if avail >= 0 {
+		show = min(show, max(avail-3, 1))
 	}
-	if !expand && hidden > 0 {
-		b.WriteString(dimStyle.Render(fmt.Sprintf("│ … %d earlier lines (ctrl+o to expand)", hidden)) + "\n")
+	hidden := len(lines) - show
+	lines = lines[hidden:]
+	if hidden > 0 {
+		suffix := ""
+		if !expand {
+			suffix = " (ctrl+o to expand)"
+		}
+		b.WriteString(dimStyle.Render(fmt.Sprintf("│ … %d earlier lines%s", hidden, suffix)) + "\n")
 	}
 	for _, ln := range lines {
 		b.WriteString(dimStyle.Render("│ ") + ln + "\n")
