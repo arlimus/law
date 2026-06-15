@@ -1111,6 +1111,22 @@ func (m model) renderRepos() string {
 	return b.String()
 }
 
+// viewportWindow returns the [start, end) slice bounds over a list of `total`
+// items that keeps `cursor` visible within `avail` terminal lines. When the
+// list doesn't fit it reserves up to two lines for the ↑/↓ "N more" scroll
+// indicators and reports how many items are hidden above/below so the caller
+// can render them.
+func viewportWindow(cursor, total, avail int) (start, end, above, below int) {
+	avail = max(avail, 1)
+	if total <= avail {
+		return 0, total, 0, 0
+	}
+	rows := max(avail-2, 1) // reserve room for the two indicator lines
+	start = min(max(cursor-rows/2, 0), total-rows)
+	end = start + rows
+	return start, end, start, total - end
+}
+
 func (m model) renderPRs() string {
 	var b strings.Builder
 	header := "law — PRs"
@@ -1144,7 +1160,26 @@ func (m model) renderPRs() string {
 		if m.currentRepo != nil {
 			owner, repoName, ownerOK = m.currentRepo.ownerRepo()
 		}
-		for i, it := range items {
+		// Window the list to the terminal height, reserving lines for the
+		// title/help chrome and (when active) the new-branch prompt so the
+		// input never scrolls off the bottom of the screen.
+		start, end := 0, len(items)
+		var above, below int
+		if m.height > 0 {
+			chromeAbove := 2 // title + blank line
+			chromeBelow := 2 // blank + help line
+			if m.prompt == promptNewBranch {
+				chromeBelow += 3 // blank + label + input line
+			} else if m.status != "" {
+				chromeBelow += 2 // blank + status line
+			}
+			start, end, above, below = viewportWindow(m.prsCursor, len(items), m.height-chromeAbove-chromeBelow)
+		}
+		if above > 0 {
+			b.WriteString(dimStyle.Render(fmt.Sprintf("  ↑ %d more", above)) + "\n")
+		}
+		for i := start; i < end; i++ {
+			it := items[i]
 			cursor := "  "
 			if i == m.prsCursor {
 				cursor = cursorStyle.Render("▸ ")
@@ -1198,6 +1233,9 @@ func (m model) renderPRs() string {
 				line += "  " + authorStyle.Render("@"+pr.Author)
 			}
 			b.WriteString(line + "\n")
+		}
+		if below > 0 {
+			b.WriteString(dimStyle.Render(fmt.Sprintf("  ↓ %d more", below)) + "\n")
 		}
 	}
 
