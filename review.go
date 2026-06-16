@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,7 +20,11 @@ type pullRequest struct {
 	HeadRef   string
 	CreatedAt time.Time
 	InReview  bool
-	Status    string // "open", "draft", "merged", "closed", "unknown"
+	// Status is a lifecycle state: "open", "draft", "merged", "closed",
+	// "unknown", or "do-not-merge". The last is not native to GitHub — it's
+	// derived from a label matching doNotMergeRe and takes precedence over
+	// "open"/"draft" to signal the author doesn't want it merged yet.
+	Status string
 	// Path is the worktree backing this PR locally, when one exists. Set live
 	// by refreshBranches; not parsed from the gh API. May be a .review<N>
 	// directory (from `gh pr checkout`) or a .branch-<x> directory (when the
@@ -41,7 +46,7 @@ type wsKey struct {
 	Branch   string
 }
 
-func prKey(n int) wsKey     { return wsKey{PRNumber: n} }
+func prKey(n int) wsKey        { return wsKey{PRNumber: n} }
 func branchKey(b string) wsKey { return wsKey{Branch: b} }
 func (k wsKey) isZero() bool   { return k.PRNumber == 0 && k.Branch == "" }
 func (k wsKey) isBranch() bool { return k.Branch != "" }
@@ -155,6 +160,24 @@ func readWorktreeBranch(path string) string {
 	return strings.TrimSpace(string(out))
 }
 
+// doNotMergeRe matches labels signalling the author doesn't want the PR
+// merged, e.g. "do not merge", "do-not-merge", "DO NOT MERGE".
+var doNotMergeRe = regexp.MustCompile(`(?i)do.not.merge`)
+
+// labelName mirrors the shape of a GitHub label in the pulls API.
+type labelName struct {
+	Name string `json:"name"`
+}
+
+func hasDoNotMergeLabel(labels []labelName) bool {
+	for _, l := range labels {
+		if doNotMergeRe.MatchString(l.Name) {
+			return true
+		}
+	}
+	return false
+}
+
 func fetchPRs(repo *Repo) ([]pullRequest, error) {
 	owner, name, ok := repo.ownerRepo()
 	if !ok {
@@ -182,6 +205,7 @@ func fetchPRs(repo *Repo) ([]pullRequest, error) {
 		Head struct {
 			Ref string `json:"ref"`
 		} `json:"head"`
+		Labels []labelName `json:"labels"`
 	}
 	if err := json.Unmarshal(out, &raw); err != nil {
 		return nil, fmt.Errorf("parsing gh output: %w", err)
@@ -199,6 +223,9 @@ func fetchPRs(repo *Repo) ([]pullRequest, error) {
 		status := "open"
 		if r.Draft {
 			status = "draft"
+		}
+		if hasDoNotMergeLabel(r.Labels) {
+			status = "do-not-merge"
 		}
 		prs = append(prs, pullRequest{
 			Number:    r.Number,

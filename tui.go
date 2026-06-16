@@ -108,8 +108,8 @@ type model struct {
 
 	reposCursor int
 
-	currentRepo *Repo
-	autoPR      int
+	currentRepo   *Repo
+	autoPR        int
 	prs           []pullRequest
 	branches      []workspace // pre-PR local branch workspaces (no matching PR)
 	prsCursor     int
@@ -630,7 +630,7 @@ func (m model) updatePRs(key tea.Key) (tea.Model, tea.Cmd) {
 			m.removeBranchByName(it.Branch)
 		} else {
 			pr := it.PR
-			if pr.Status == "open" || pr.Status == "draft" {
+			if pr.Status == "open" || pr.Status == "draft" || pr.Status == "do-not-merge" {
 				for i := range m.prs {
 					if m.prs[i].Number == pr.Number {
 						m.prs[i].InReview = false
@@ -743,6 +743,17 @@ func (m model) transitionBranchToPR(branch string, prNumber int) (tea.Model, tea
 	m.branchCommits = 0
 	m.status = fmt.Sprintf("PR #%d opened", prNumber)
 	return m, fetchPRsCmd(m.currentRepo)
+}
+
+// prStatus returns the lifecycle status of the PR with the given number, or ""
+// if it isn't in the current list.
+func (m model) prStatus(prNumber int) string {
+	for i := range m.prs {
+		if m.prs[i].Number == prNumber {
+			return m.prs[i].Status
+		}
+	}
+	return ""
 }
 
 func (m model) openActionsPR(prNumber int) (tea.Model, tea.Cmd) {
@@ -1061,10 +1072,11 @@ func hyperlink(url, text string) string {
 
 // Nerd Fonts Octicons for PR state.
 const (
-	mergedIcon = "" // nf-oct-git_merge
-	closedIcon = "" // nf-oct-git_pull_request_closed
-	draftIcon  = "⏹"
-	branchIcon = "" // nf-oct-git_branch
+	mergedIcon     = "" // nf-oct-git_merge
+	closedIcon     = "" // nf-oct-git_pull_request_closed
+	draftIcon      = "⏹"
+	branchIcon     = "" // nf-oct-git_branch
+	doNotMergeIcon = "" // nf-fa-circle_stop
 )
 
 // githubIcon is the Nerd Fonts FontAwesome github glyph (nf-fa-github, U+F09B).
@@ -1219,6 +1231,8 @@ func (m model) renderPRs() string {
 				statusIcon = warnStyle.Render(closedIcon) + " "
 			case "draft":
 				statusIcon = dimStyle.Render(draftIcon) + " "
+			case "do-not-merge":
+				statusIcon = warnStyle.Render(doNotMergeIcon) + " "
 			}
 			rest := ": " + pr.Title
 			if i == m.prsCursor {
@@ -1270,6 +1284,9 @@ func (m model) renderActions() string {
 			b.WriteString(titleStyle.Render(fmt.Sprintf("law - %s %s #%d", githubIcon, m.currentRepo.URL, m.activeWS.PRNumber)) + "\n")
 		}
 		if m.activeWS.isPR() {
+			if m.prStatus(m.activeWS.PRNumber) == "do-not-merge" {
+				b.WriteString(warnStyle.Render(doNotMergeIcon+" do not merge — the author doesn't want this merged") + "\n")
+			}
 			for _, p := range m.previews[m.activeWS.PRNumber] {
 				b.WriteString(hyperlink(p.URL, authorStyle.Render(previewIcon)+" preview: "+p.Name) + "\n")
 			}
